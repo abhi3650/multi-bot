@@ -1,7 +1,6 @@
 import time
 from pyrogram import Client, filters
 from pyrogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
-from pyrogram.enums import ParseMode
 import database as db
 from config import PREMIUM_PRICE, PREMIUM_DAYS, UPI_ID, FREE_MEDIA_LIMIT, FREE_POSTER_LIMIT
 
@@ -12,7 +11,7 @@ HELP_TEXT = """
 
 ━━━━━━━━━━━━━━━━━━
 **🎬 Movie & OTT**
-`/imdb <title>` — Detailed info from TMDB/IMDB
+`/imdb <title>` — Movie/Series info from TMDB
 `/ott <title>` — Check streaming availability
 `/posters <title>` — Browse movie posters
 
@@ -42,7 +41,6 @@ HELP_TEXT = """
 async def cmd_start(client: Client, message: Message):
     u = message.from_user
     await db.ensure_user(u.id, u.username, u.first_name or "")
-
     text = (
         f"👋 Hello, **{u.first_name}**!\n\n"
         "Your all-in-one Telegram utility bot.\n\n"
@@ -140,34 +138,39 @@ async def premium_callback(client: Client, cq: CallbackQuery):
         await cq.message.edit(HELP_TEXT, reply_markup=InlineKeyboardMarkup([[
             InlineKeyboardButton("🔙 Back", callback_data="premium_cancel")
         ]]))
-
     elif action == "premium_info":
         await _show_premium(cq)
-
     elif action == "premium_verify":
         _awaiting_utr.add(cq.from_user.id)
         await cq.message.edit(
             "📤 Please send your **UTR / Transaction ID** now.\n\n"
             "_Your payment will be verified and Premium activated shortly._"
         )
-
     elif action == "premium_cancel":
         _awaiting_utr.discard(cq.from_user.id)
         await cq.message.delete()
 
 
-@Client.on_message(filters.private & filters.text & filters.regex(r"^(?!/)"))
+# ── UTR capture — plain text messages in private chat ─────────────────────────
+# NOTE: We use filters.text only (no ~filters.command) and check for '/' inside
+# the handler. This avoids the Pyrogram 2.x TypeError with ~filters.command.
+@Client.on_message(filters.private & filters.text)
 async def text_handler(client: Client, message: Message):
-    """Captures plain text messages — used to collect UTR codes for premium payment."""
+    # Ignore commands — let their own handlers deal with them
+    if message.text and message.text.startswith("/"):
+        return
+
     uid = message.from_user.id
     if uid not in _awaiting_utr:
-        return
+        return   # not waiting for anything from this user
+
     utr = message.text.strip()
     if len(utr) < 6:
         return await message.reply("❌ That doesn't look like a valid UTR. Please try again.")
+
     await db.add_pending(uid, utr)
     _awaiting_utr.discard(uid)
     await message.reply(
-        f"✅ UTR `{utr}` received!\n\nYour payment is being verified. "
-        "Premium will be activated within a few minutes.",
+        f"✅ UTR `{utr}` received!\n\n"
+        "Your payment is being verified. Premium will be activated within a few minutes."
     )
