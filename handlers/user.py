@@ -156,8 +156,9 @@ async def premium_callback(client: Client, cq: CallbackQuery):
         await cq.message.delete()
 
 
-@Client.on_message(filters.private & filters.text & ~filters.command)
+@Client.on_message(filters.private & filters.text & filters.regex(r"^(?!/)"))
 async def text_handler(client: Client, message: Message):
+    """Captures plain text messages — used to collect UTR codes for premium payment."""
     uid = message.from_user.id
     if uid not in _awaiting_utr:
         return
