@@ -14,7 +14,6 @@ import logging
 import mimetypes
 import secrets
 import time
-from pathlib import Path
 from typing import Optional
 
 from aiohttp import web, ClientSession
@@ -24,7 +23,126 @@ logger = logging.getLogger(__name__)
 _TOKENS: dict[str, dict] = {}
 LINK_TTL = 3600   # 1 hour
 
-_TEMPLATE = (Path(__file__).parent / "templates" / "watch.html").read_text()
+# ── Inline watch page — no external file dependency ───────────────────────────
+# Placeholders filled at request time:
+#   {title}  {filename}  {size}  {mime}  {tag}  {dl_url}
+_TEMPLATE = """<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>{title}</title>
+  <style>
+    *, *::before, *::after {{ box-sizing: border-box; margin: 0; padding: 0; }}
+    body {{
+      min-height: 100vh;
+      background: #0f0f0f;
+      color: #e0e0e0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 24px 16px;
+      gap: 20px;
+    }}
+    header {{
+      width: 100%;
+      max-width: 860px;
+      border-bottom: 1px solid #2a2a2a;
+      padding-bottom: 12px;
+    }}
+    header h1 {{
+      font-size: 1.1rem;
+      font-weight: 600;
+      color: #fff;
+      word-break: break-all;
+    }}
+    header p {{
+      font-size: 0.82rem;
+      color: #888;
+      margin-top: 4px;
+    }}
+    .player-wrap {{
+      width: 100%;
+      max-width: 860px;
+      background: #1a1a1a;
+      border-radius: 12px;
+      overflow: hidden;
+      box-shadow: 0 8px 32px rgba(0,0,0,.6);
+    }}
+    {tag} {{
+      width: 100%;
+      display: block;
+      max-height: 72vh;
+      background: #000;
+    }}
+    .actions {{
+      display: flex;
+      gap: 12px;
+      flex-wrap: wrap;
+      width: 100%;
+      max-width: 860px;
+    }}
+    a.btn {{
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 10px 20px;
+      border-radius: 8px;
+      font-size: 0.9rem;
+      font-weight: 500;
+      text-decoration: none;
+      transition: opacity .15s;
+    }}
+    a.btn:hover {{ opacity: .85; }}
+    .btn-dl  {{ background: #2563eb; color: #fff; }}
+    .btn-cp  {{ background: #1f2937; color: #e0e0e0; border: 1px solid #374151; cursor: pointer; }}
+    footer {{
+      font-size: 0.75rem;
+      color: #444;
+      margin-top: auto;
+    }}
+  </style>
+</head>
+<body>
+  <header>
+    <h1>📄 {filename}</h1>
+    <p>Size: {size} &nbsp;•&nbsp; Type: {mime}</p>
+  </header>
+
+  <div class="player-wrap">
+    <{tag} controls preload="metadata" src="{dl_url}">
+      Your browser does not support this media type.
+    </{tag}>
+  </div>
+
+  <div class="actions">
+    <a class="btn btn-dl" href="{dl_url}" download="{filename}">⬇️ Download</a>
+    <a class="btn btn-cp" onclick="copyLink(this)">🔗 Copy Link</a>
+  </div>
+
+  <footer>Link expires in 1 hour &nbsp;•&nbsp; Powered by the bot</footer>
+
+  <script>
+    function copyLink(btn) {{
+      navigator.clipboard.writeText('{dl_url}').then(() => {{
+        btn.textContent = '✅ Copied!';
+        setTimeout(() => btn.textContent = '🔗 Copy Link', 2000);
+      }});
+    }}
+    // Attempt to resume from last position via localStorage
+    const player = document.querySelector('video, audio');
+    const key = 'pos_{title}';
+    if (player) {{
+      const saved = parseFloat(localStorage.getItem(key) || '0');
+      if (saved > 2) player.currentTime = saved;
+      player.addEventListener('timeupdate', () => {{
+        if (!player.paused) localStorage.setItem(key, player.currentTime);
+      }});
+    }}
+  </script>
+</body>
+</html>"""
 
 
 def create_token(
