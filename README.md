@@ -1,97 +1,162 @@
-# Multipurpose Telegram Bot (Pyrogram)
+# Multipurpose Telegram Bot
 
-A fully-featured Telegram bot built on **Pyrogram** (MTProto) — no Bot API file-size limits.
+A clean, feature-rich Telegram bot for small groups and friends.
 
 ---
 
-## Features
+## Commands
 
+### 🎬 Movie & OTT
 | Command | Description |
 |---|---|
-| `/imdb <title>` | Movie/series info from TMDB + IMDB |
-| `/ott <title>` | OTT streaming availability (JustWatch → TMDB fallback) |
-| `/posters <title>` | Browse movie posters with navigation |
-| `/mediainfo` | Codec, resolution, bitrate — reply to video or pass URL |
-| `/sample` | Generate a 30-second preview clip |
-| `/screenshot` | Take 10 screenshots from a video |
-| `/link` | Generate Watch Online + Download link (any file size) |
-| `/yt <url>` | YouTube quality picker + direct download link |
-| `/song <name>` | Search YouTube Music → pick from 8 results → get MP3 with album art |
-| `/usage` | View your monthly usage |
-| `/premium` | Upgrade for unlimited access |
+| `/imdb <title>` | Movie/Series info — rating, cast, genres, poster |
+| `/ott <title>` | OTT streaming availability via JustWatch |
+| `/posters <title>` | Browse movie posters with pagination |
+
+### 🎞 Video Tools
+| Command | Description |
+|---|---|
+| `/mediainfo` | Codec, resolution, bitrate, audio info _(reply to video)_ |
+| `/sample` | Generate 30-second preview clip _(reply to video)_ |
+| `/screenshot` | Take 10 evenly-spaced screenshots _(reply to video)_ |
+| `/yt <url>` | YouTube quality picker → direct download link (no upload) |
+
+### 📊 Account
+| Command | Description |
+|---|---|
+| `/start` | Welcome message + command list |
+| `/help` | Full command reference |
+| `/usage` | Your monthly usage stats |
+| `/premium` | Upgrade to Premium (unlimited access) |
+
+### 🔐 Admin Only
+| Command | Description |
+|---|---|
+| `/restart` | Restart the bot |
+| `/addpremium <user_id> [days]` | Grant premium to a user |
+| `/removepremium <user_id>` | Revoke premium |
+| `/pending` | View pending payment verifications |
+| `/stats` | Total users & premium count |
+| `/broadcast <message>` | Send message to all users |
 
 ---
 
 ## Setup
 
-### 1. Clone / extract the project
-
-```bash
-cd multipurpose_bot
-```
+### 1. Prerequisites
+- Python 3.11+
+- FFmpeg: `sudo apt install ffmpeg`
+- Bot token from [@BotFather](https://t.me/BotFather)
+- Free TMDB API key from [themoviedb.org](https://www.themoviedb.org/settings/api)
 
 ### 2. Install dependencies
-
 ```bash
 pip install -r requirements.txt
 ```
 
-> Also install system dependencies:
-> ```bash
-> apt install ffmpeg mediainfo   # Debian/Ubuntu
-> ```
-
-### 3. Configure `.env`
-
+### 3. Configure
 ```bash
 cp .env.example .env
 nano .env
 ```
 
-**Required fields:**
-
-| Key | Where to get |
-|---|---|
-| `BOT_TOKEN` | [@BotFather](https://t.me/BotFather) |
-| `API_ID` | [my.telegram.org/apps](https://my.telegram.org/apps) |
-| `API_HASH` | Same as above |
-| `TMDB_API_KEY` | [themoviedb.org/settings/api](https://www.themoviedb.org/settings/api) |
-
-**Optional:**
-
-| Key | Purpose |
-|---|---|
-| `STREAM_BASE_URL` | Public URL for `/link` watch/download pages (e.g. `http://YOUR_IP:8080`) |
-| `JUSTWATCH_API` | JustWatch API key — `/ott` uses JustWatch first, falls back to TMDB |
-| `UPI_ID` | Your UPI ID for premium payments |
+Fill in:
+```env
+BOT_TOKEN=your_token_here
+TMDB_API_KEY=your_tmdb_key_here
+ADMIN_IDS=your_telegram_id
+UPI_ID=yourname@upi
+```
 
 ### 4. Run
-
 ```bash
 python bot.py
 ```
 
+### 5. Run as systemd service (keep alive 24/7)
+```bash
+sudo nano /etc/systemd/system/tgbot.service
+```
+```ini
+[Unit]
+Description=Multipurpose Telegram Bot
+After=network.target
+
+[Service]
+User=ubuntu
+WorkingDirectory=/home/ubuntu/multipurpose_bot
+ExecStart=/usr/bin/python3 /home/ubuntu/multipurpose_bot/bot.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+```
+```bash
+sudo systemctl enable tgbot
+sudo systemctl start tgbot
+sudo systemctl status tgbot
+```
+
 ---
 
-## Large File Support
+## Premium System
 
-With `API_ID` + `API_HASH` configured, the bot uses **Pyrogram's MTProto** to:
-- Download files of any size (up to 4 GB) for `/mediainfo`, `/sample`, `/screenshot`
-- Stream files of any size via `/link` using the built-in aiohttp server
-
-Without these credentials, file operations are limited to **20 MB** (Telegram Bot API cap).
+1. User sends `/premium` — sees price + UPI ID
+2. User pays and taps **Verify**
+3. User sends their UTR/Transaction ID
+4. Admin runs `/pending` to see all requests
+5. Admin runs `/addpremium <user_id>` to activate
+6. User gets notified automatically
 
 ---
 
-## Admin Commands
+## Usage Limits (Free Tier)
 
-| Command | Description |
-|---|---|
-| `/addpremium <uid> [days]` | Grant premium to a user |
-| `/removepremium <uid>` | Revoke premium |
-| `/pending` | View pending payment verifications |
-| `/stats` | Bot usage statistics |
-| `/broadcast <text>` | Send message to all users |
-| `/restart` | Restart the bot process |
+| Feature | Free | Premium |
+|---|---|---|
+| Video tools (mediainfo/sample/screenshot) | 20/month | Unlimited |
+| Poster searches | 10/month | Unlimited |
+| /yt, /imdb, /ott | Unlimited | Unlimited |
 
-Set `ADMIN_IDS=your_telegram_id` in `.env`.
+---
+
+## How /yt Works
+
+```
+User: /yt https://youtube.com/watch?v=xxx
+         ↓
+Bot fetches video info (yt-dlp, no download)
+         ↓
+Sends thumbnail + quality buttons:
+  [🎥 1080p]  [🎥 720p]
+  [🎥 480p]   [🎥 360p]
+  [🎵 MP3 Audio]
+         ↓
+User taps quality
+         ↓
+Bot calls cobalt.tools API → gets direct link
+         ↓
+Sends: ⬇️ Tap here to download
+```
+The bot never downloads or stores the video. The link goes directly to the user.
+
+---
+
+## File Structure
+
+```
+multipurpose_bot/
+├── bot.py              ← Entry point
+├── config.py           ← Settings (reads .env)
+├── database.py         ← SQLite: users, usage, premium
+├── handlers/
+│   ├── movie.py        ← /imdb /ott /posters
+│   ├── media.py        ← /mediainfo /sample /screenshot
+│   ├── ytdl.py         ← /yt
+│   ├── user.py         ← /start /help /usage /premium
+│   └── admin.py        ← admin commands
+├── requirements.txt
+├── .env.example
+└── README.md
+```

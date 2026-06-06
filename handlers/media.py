@@ -2,104 +2,74 @@
 handlers/media.py
 Commands: /mediainfo  /sample  /screenshot
 
-Large-file strategy
-───────────────────
-Pyrogram (MTProto) can download files of ANY size using client.download_media().
-This completely replaces the old Bot-API 20 MB cap.
+All three work in two modes:
+  1. Reply to any video/document → uses internal stream server (ByteStreamer)
+     → ffmpeg accesses the file via http://127.0.0.1:PORT/dl/TOKEN
+     → NO file size limit, no local download needed
+  2. /command <url> → yt-dlp extracts CDN URL → ffmpeg streams it
 
-Usage:
-  Reply to any video/document with the command, OR pass a URL:
-  /mediainfo <url>  /sample <url>  /screenshot <url>
+All blocking operations run in asyncio.to_thread() for concurrency.
 """
-
 import asyncio
-import io
-import json
 import os
 import subprocess
 import tempfile
+from typing import Optional
 
 import ffmpeg
 import httpx
 import yt_dlp
 from pyrogram import Client, filters
-from pyrogram.types import Message, InputMediaPhoto
+from pyrogram.types import InputMediaPhoto, Message
 
 import database as db
+from config import STREAM_PORT
+from stream_server import create_token
 
 SCREENSHOT_COUNT = 10
 
-_SECTION_EMOJI = {
-    "General": "🗒", "Video": "🎞", "Audio": "🔊", "Text": "🔠", "Menu": "🗃",
-}
+
+# ── Shared helpers ─────────────────────────────────────────────────────────────
+
+def _limit_msg(allowed: bool, used: int, limit: int) -> str | None:
+    return (
+        f"⚠️ You've used {used}/{limit} media operations this month.\n"
+        "Upgrade to Premium for unlimited access!"
+    ) if not allowed else None
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
-
-def _limit_err(allowed: bool, used: int, limit: int) -> str | None:
-    if not allowed:
-        return (
-            f"⚠️ You've used {used}/{limit} media operations this month.\n"
-            "Upgrade to Premium for unlimited access!"
-        )
-    return None
-
-
-def _get_video_from_reply(message: Message):
-    """Return (media_obj, filename, size) from the replied-to message, or (None,None,0)."""
-    r = message.reply_to_message
-    if not r:
-        return None, None, 0
-    if r.video:
-        return r.video, r.video.file_name or "video.mp4", r.video.file_size or 0
-    if r.document and (r.document.mime_type or "").startswith("video"):
-        return r.document, r.document.file_name or "video.mkv", r.document.file_size or 0
-    return None, None, 0
+def _get_media(message: Message):
+    """Return (file_id, filename, file_size, mime) from a message, or all-None."""
+    if message.video:
+        v = message.video
+        return v.file_id, (v.file_name or "video.mp4"), (v.file_size or 0), (v.mime_type or "video/mp4")
+    if message.document:
+        d = message.document
+        if (d.mime_type or "").startswith("video"):
+            return d.file_id, (d.file_name or "video.mkv"), (d.file_size or 0), (d.mime_type or "video/x-matroska")
+    return None, None, 0, None
 
 
-async def _download_tg(client: Client, media_obj, dest_dir: str, filename: str) -> str:
-    """
-    Download a Telegram media file using Pyrogram's MTProto path — no size limit.
-    Returns the local file path.
-    """
-    dest = os.path.join(dest_dir, filename)
-    await client.download_media(media_obj, file_name=dest)
-    return dest
+def _internal_stream_url(file_id: str, size: int, mime: str, name: str) -> str:
+    """Create a token and return the localhost stream URL for ffmpeg."""
+    token = create_token(name, size, mime, tg_file_id=file_id)
+    return f"http://127.0.0.1:{STREAM_PORT}/dl/{token}"
 
 
-async def _ydl_stream_url(url: str) -> dict:
-    """
-    Resolve a YouTube / social URL to a direct CDN URL via yt-dlp.
-    Returns {"single": url} or {"video": v_url, "audio": a_url}.
-    Falls back to {"single": url} for plain HTTP links.
-    """
-    social = ("youtube.com", "youtu.be", "vimeo.com", "instagram.com",
-              "twitter.com", "tiktok.com", "facebook.com")
-    if not any(s in url for s in social):
-        return {"single": url}
-
+async def _ydl_stream_url(url: str) -> str:
+    """Get a direct CDN URL for a YouTube/social URL via yt-dlp."""
     def _extract():
         with yt_dlp.YoutubeDL({
-            "quiet":         True,
-            "skip_download": True,
-            "format":        "bestvideo[ext=mp4][height<=1080]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+            "quiet": True, "skip_download": True,
+            "format": "best[ext=mp4]/best",
             "extractor_args": {"youtube": {"player_client": ["android"]}},
         }) as ydl:
             info = ydl.extract_info(url, download=False)
-            fmts = info.get("requested_formats") or []
-            if len(fmts) >= 2:
-                v = next((f["url"] for f in fmts if f.get("vcodec", "none") != "none"), None)
-                a = next((f["url"] for f in fmts if
-                          f.get("acodec", "none") != "none" and
-                          f.get("vcodec", "none") == "none"), None)
-                if v and a:
-                    return {"video": v, "audio": a}
-            return {"single": info.get("url") or url}
-
+            return info.get("url") or url
     try:
         return await asyncio.to_thread(_extract)
     except Exception:
-        return {"single": url}
+        return url
 
 
 def _probe(src: str) -> dict:
@@ -109,10 +79,10 @@ def _probe(src: str) -> dict:
         return {}
 
 
-def _duration(data: dict) -> float:
+def _dur(probe_data: dict) -> float:
     try:
-        return float(data.get("format", {}).get("duration", 0))
-    except (ValueError, TypeError):
+        return float(probe_data.get("format", {}).get("duration", 0))
+    except Exception:
         return 0.0
 
 
@@ -120,62 +90,73 @@ async def _run_ff(node):
     await asyncio.to_thread(lambda: node.overwrite_output().run(capture_output=True))
 
 
-def _has_mediainfo() -> bool:
-    try:
-        subprocess.run(["mediainfo", "--version"], capture_output=True, timeout=5)
-        return True
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        return False
+# ── /mediainfo ─────────────────────────────────────────────────────────────────
+
+@Client.on_message(filters.command("mediainfo"))
+async def cmd_mediainfo(client: Client, message: Message):
+    u = message.from_user
+    await db.ensure_user(u.id, u.username, u.first_name or "")
+    allowed, used, limit = await db.check_and_consume(u.id, "media")
+    if err := _limit_msg(allowed, used, limit):
+        return await message.reply(err)
+
+    args = message.command[1:]
+
+    # URL mode
+    if args and args[0].startswith("http"):
+        msg = await message.reply("⏳ Fetching media info from URL…")
+        src = await _ydl_stream_url(args[0])
+        return await _do_mediainfo(message, msg, src, args[0].split("/")[-1][:50])
+
+    # File mode
+    replied = message.reply_to_message
+    if not replied:
+        return await message.reply(
+            "↩️ Reply to a video with `/mediainfo`, or:\n`/mediainfo <url>`"
+        )
+    file_id, name, size, mime = _get_media(replied)
+    if not file_id:
+        return await message.reply("❌ Reply to a video or video file.")
+
+    msg = await message.reply("⏳ Fetching media info…")
+    src = _internal_stream_url(file_id, size, mime, name)
+    await _do_mediainfo(message, msg, src, name)
 
 
-def _run_mediainfo(path: str) -> str | None:
-    try:
-        r = subprocess.run(["mediainfo", path], capture_output=True, text=True, timeout=60)
-        return r.stdout if r.returncode == 0 else None
-    except Exception:
-        return None
+async def _do_mediainfo(message: Message, msg, src: str, name: str):
+    # Try mediainfo CLI first
+    def _run_cli():
+        try:
+            r = subprocess.run(["mediainfo", src], capture_output=True, text=True, timeout=60)
+            return r.stdout if r.returncode == 0 else None
+        except Exception:
+            return None
 
+    raw_output = await asyncio.to_thread(_run_cli)
 
-async def _post_telegraph(filename: str, raw: str) -> str | None:
-    """Post mediainfo CLI output to Telegraph and return the page URL."""
-    lines   = raw.split("\n")
-    nodes   = []
-    section = []
-    for line in lines:
-        is_sec = any(line.startswith(s) for s in _SECTION_EMOJI)
-        if is_sec:
-            if section:
-                nodes.append({"tag": "pre", "children": ["\n".join(section)]})
-                section = []
-            emoji = next((e for s, e in _SECTION_EMOJI.items() if line.startswith(s)), "📋")
-            nodes.append({"tag": "h4", "children": [f"{emoji} {line}"]})
-        elif line.strip():
-            section.append(line)
-    if section:
-        nodes.append({"tag": "pre", "children": ["\n".join(section)]})
-
-    try:
-        async with httpx.AsyncClient(timeout=20) as hx:
-            acc  = await hx.get(
-                "https://api.telegra.ph/createAccount",
-                params={"short_name": "MediaInfoBot", "author_name": "MediaInfo"},
+    if raw_output:
+        # Post to Telegraph
+        telegraph_url = await _to_telegraph(name, raw_output)
+        if telegraph_url:
+            from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+            return await msg.edit(
+                f"📊 **MediaInfo:** `{name}`\n\n[Click here to view full report]({telegraph_url})",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("📄 Open Report", url=telegraph_url)
+                ]]),
             )
-            tok  = acc.json()["result"]["access_token"]
-            page = await hx.post(
-                "https://api.telegra.ph/createPage",
-                json={
-                    "access_token": tok,
-                    "title":        f"MediaInfo: {filename}"[:256],
-                    "author_name":  "MediaInfo Bot",
-                    "content":      nodes,
-                },
-            )
-            return f"https://telegra.ph/{page.json()['result']['path']}"
-    except Exception:
-        return None
+        # Telegraph failed → inline
+        lines = [l for l in raw_output.split("\n") if l.strip()]
+        return await msg.edit(f"📊 **{name}**\n\n```\n" + "\n".join(lines[:50]) + "\n```")
+
+    # Fallback: ffprobe
+    data = await asyncio.to_thread(_probe, src)
+    if not data:
+        return await msg.edit("❌ Could not read media info.")
+    await msg.edit(_ffprobe_text(data, name))
 
 
-def _build_ffprobe_text(data: dict, name: str) -> str:
+def _ffprobe_text(data: dict, name: str) -> str:
     fmt     = data.get("format", {})
     dur     = float(fmt.get("duration", 0))
     h, rem  = divmod(int(dur), 3600)
@@ -183,7 +164,7 @@ def _build_ffprobe_text(data: dict, name: str) -> str:
     size_mb = int(fmt.get("size", 0)) / 1024 / 1024
     bitrate = int(fmt.get("bit_rate", 0)) // 1000
     lines   = [
-        f"📊 *MediaInfo: {name}*\n",
+        f"📊 **MediaInfo: {name}**\n",
         f"⏱ Duration : `{h:02d}:{m:02d}:{s:02d}`",
         f"💾 Size     : `{size_mb:.2f} MB`",
         f"📡 Bitrate  : `{bitrate} kbps`\n",
@@ -192,7 +173,7 @@ def _build_ffprobe_text(data: dict, name: str) -> str:
         ct = st.get("codec_type", "")
         if ct == "video":
             lines += [
-                "🎥 *Video Stream*",
+                "🎥 **Video Stream**",
                 f"  Codec     : `{st.get('codec_name','?').upper()}`",
                 f"  Resolution: `{st.get('width','?')}×{st.get('height','?')}`",
                 f"  FPS       : `{st.get('avg_frame_rate','?')}`",
@@ -200,244 +181,165 @@ def _build_ffprobe_text(data: dict, name: str) -> str:
             ]
         elif ct == "audio":
             lines += [
-                "🔊 *Audio Stream*",
+                "🔊 **Audio Stream**",
                 f"  Codec      : `{st.get('codec_name','?').upper()}`",
                 f"  Channels   : `{st.get('channels','?')}`",
-                f"  Sample Rate: `{st.get('sample_rate','?')} Hz`",
-                f"  Bitrate    : `{int(st.get('bit_rate',0))//1000} kbps`\n",
+                f"  Sample Rate: `{st.get('sample_rate','?')} Hz`\n",
             ]
-        elif ct == "subtitle":
-            lang = st.get("tags", {}).get("language", "?")
-            lines.append(f"💬 Subtitle: `{st.get('codec_name','?')} ({lang})`")
     return "\n".join(lines)
 
 
-# ── Handler registration ──────────────────────────────────────────────────────
+async def _to_telegraph(filename: str, raw_output: str) -> Optional[str]:
+    """Post mediainfo to Telegraph; return URL or None."""
+    try:
+        lines   = raw_output.split("\n")
+        nodes   = []
+        section = []
+        SECTION_EMOJI = {"General":"🗒","Video":"🎞","Audio":"🔊","Text":"🔠","Menu":"🗃"}
+        for line in lines:
+            is_section = any(line.startswith(s) for s in SECTION_EMOJI)
+            if is_section:
+                if section:
+                    nodes.append({"tag":"pre","children":["\n".join(section)]})
+                    section = []
+                emoji = next((e for s,e in SECTION_EMOJI.items() if line.startswith(s)), "📋")
+                nodes.append({"tag":"h4","children":[f"{emoji} {line}"]})
+            elif line.strip():
+                section.append(line)
+        if section:
+            nodes.append({"tag":"pre","children":["\n".join(section)]})
 
-def register(app: Client):
+        async with httpx.AsyncClient(timeout=15) as c:
+            acc  = await c.get("https://api.telegra.ph/createAccount",
+                               params={"short_name":"MediaInfoBot","author_name":"MediaInfo"})
+            tok  = acc.json()["result"]["access_token"]
+            page = await c.post("https://api.telegra.ph/createPage", json={
+                "access_token": tok,
+                "title":        f"MediaInfo: {filename}"[:256],
+                "author_name":  "MediaInfo Bot",
+                "content":      nodes,
+            })
+            return f"https://telegra.ph/{page.json()['result']['path']}"
+    except Exception:
+        return None
 
-    # ── /mediainfo ────────────────────────────────────────────────────────────
 
-    @app.on_message(filters.command("mediainfo"))
-    async def cmd_mediainfo(client: Client, message: Message):
-        u = message.from_user
-        await db.ensure_user(u.id, u.username, u.full_name)
-        allowed, used, limit = await db.check_and_consume(u.id, "media")
-        if err := _limit_err(allowed, used, limit):
-            await message.reply(err)
-            return
+# ── /sample ────────────────────────────────────────────────────────────────────
 
-        args = message.command[1:]
+@Client.on_message(filters.command("sample"))
+async def cmd_sample(client: Client, message: Message):
+    u = message.from_user
+    await db.ensure_user(u.id, u.username, u.first_name or "")
+    allowed, used, limit = await db.check_and_consume(u.id, "media")
+    if err := _limit_msg(allowed, used, limit):
+        return await message.reply(err)
 
-        # URL mode
-        if args and args[0].startswith("http"):
-            wait = await message.reply("⏳ Fetching media info from URL…")
-            info = await _ydl_stream_url(args[0])
-            src  = info.get("single") or info.get("video")
-            name = args[0].split("?")[0].split("/")[-1][:60] or "video"
-            await _do_mediainfo(wait, src, name, local=False)
-            return
+    args = message.command[1:]
+    if args and args[0].startswith("http"):
+        msg   = await message.reply("⏳ Generating sample from URL…")
+        src   = await _ydl_stream_url(args[0])
+        label = args[0].split("?")[0].split("/")[-1][:40] or "video"
+        return await _make_sample(message, msg, src, label)
 
-        media_obj, fname, fsize = _get_video_from_reply(message)
-        if not media_obj:
-            await message.reply(
-                "↩️ Reply to a video with `/mediainfo`, or:\n`/mediainfo <url>`"
-            )
-            return
+    replied = message.reply_to_message
+    if not replied:
+        return await message.reply("↩️ Reply to a video with `/sample`, or:\n`/sample <url>`")
 
-        size_str = f"{fsize/1024/1024:.1f} MB" if fsize else "unknown size"
-        wait     = await message.reply(f"⏳ Downloading ({size_str}) and reading media info…")
+    file_id, name, size, mime = _get_media(replied)
+    if not file_id:
+        return await message.reply("❌ Reply to a video or video file.")
 
-        with tempfile.TemporaryDirectory() as tmp:
-            try:
-                path = await _download_tg(client, media_obj, tmp, fname)
-            except Exception as e:
-                await wait.edit(f"❌ Download failed:\n`{e}`")
-                return
-            await _do_mediainfo(wait, path, fname, local=True)
+    msg = await message.reply("⏳ Generating sample clip…")
+    src = _internal_stream_url(file_id, size, mime, name)
+    await _make_sample(message, msg, src, os.path.splitext(name)[0])
 
-    async def _do_mediainfo(wait, src: str, name: str, local: bool):
-        use_cli = _has_mediainfo()
-        if use_cli:
-            raw = await asyncio.to_thread(_run_mediainfo, src)
-            if raw:
-                tg_url = await _post_telegraph(name, raw)
-                if tg_url:
-                    from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-                    await wait.edit(
-                        f"📊 *MediaInfo: {name}*\n\n[Click here to view full report]({tg_url})",
-                        reply_markup=InlineKeyboardMarkup([[
-                            InlineKeyboardButton("📄 Open Report", url=tg_url)
-                        ]]),
-                    )
-                    return
-                # Telegraph failed — show first 60 lines inline
-                lines = [l for l in raw.split("\n") if l.strip()]
-                await wait.edit(f"📊 *{name}*\n\n```\n" + "\n".join(lines[:60]) + "\n```")
-                return
 
+async def _make_sample(message: Message, msg, src: str, label: str):
+    with tempfile.TemporaryDirectory() as tmp:
+        out  = os.path.join(tmp, "sample.mp4")
         data = await asyncio.to_thread(_probe, src)
-        if not data:
-            await wait.edit("❌ Could not read media info.")
-            return
-        await wait.edit(_build_ffprobe_text(data, name))
+        dur  = _dur(data)
+        if dur < 10:
+            return await msg.edit("❌ Video is too short.")
 
-    # ── /sample ───────────────────────────────────────────────────────────────
-
-    @app.on_message(filters.command("sample"))
-    async def cmd_sample(client: Client, message: Message):
-        u = message.from_user
-        await db.ensure_user(u.id, u.username, u.full_name)
-        allowed, used, limit = await db.check_and_consume(u.id, "media")
-        if err := _limit_err(allowed, used, limit):
-            await message.reply(err)
-            return
-
-        args = message.command[1:]
-
-        if args and args[0].startswith("http"):
-            wait  = await message.reply("⏳ Generating sample clip from URL…")
-            info  = await _ydl_stream_url(args[0])
-            label = args[0].split("?")[0].split("/")[-1][:40] or "video"
-            await _make_sample(client, message, wait, info, label, local_src=None)
-            return
-
-        media_obj, fname, fsize = _get_video_from_reply(message)
-        if not media_obj:
-            await message.reply("↩️ Reply to a video with `/sample`, or:\n`/sample <url>`")
-            return
-
-        size_str = f"{fsize/1024/1024:.1f} MB" if fsize else "unknown size"
-        wait     = await message.reply(f"⏳ Downloading ({size_str}) and generating 30s sample…")
-
-        with tempfile.TemporaryDirectory() as tmp:
-            try:
-                path = await _download_tg(client, media_obj, tmp, fname)
-            except Exception as e:
-                await wait.edit(f"❌ Download failed:\n`{e}`")
-                return
-            await _make_sample(client, message, wait, {"single": path},
-                               os.path.splitext(fname)[0], local_src=tmp)
-
-    async def _make_sample(client, message, wait, stream_info, label, local_src):
-        with tempfile.TemporaryDirectory() as tmp:
-            out = os.path.join(tmp, "sample.mp4")
-            src = stream_info.get("single") or stream_info.get("video")
-
-            data = await asyncio.to_thread(_probe, src)
-            dur  = _duration(data)
-            if dur < 10:
-                await wait.edit("❌ Video is too short to generate a sample.")
-                return
-
-            start = max(10.0, dur * 0.15)
-            try:
-                if "single" in stream_info:
-                    node = (ffmpeg
-                            .input(stream_info["single"], ss=start, t=30)
-                            .output(out, **{
-                                "c:v": "libx264", "preset": "fast", "crf": "28",
-                                "c:a": "aac", "b:a": "128k", "movflags": "+faststart",
-                            }))
-                else:
-                    v = ffmpeg.input(stream_info["video"], ss=start, t=30)
-                    a = ffmpeg.input(stream_info["audio"], ss=start, t=30)
-                    node = ffmpeg.output(v["v"], a["a"], out, **{
-                        "c:v": "libx264", "preset": "fast", "crf": "28",
-                        "c:a": "aac", "b:a": "128k", "movflags": "+faststart",
-                    })
-                await _run_ff(node)
-            except Exception as e:
-                await wait.edit(f"❌ Sample generation failed:\n`{e}`")
-                return
-
-            if not os.path.exists(out):
-                await wait.edit("❌ Sample generation failed.")
-                return
-
-            await wait.delete()
-            await client.send_video(
-                message.chat.id,
-                out,
-                caption=f"🎬 *[#Sample]* `{label}`",
-                supports_streaming=True,
+        start = max(10.0, dur * 0.15)
+        try:
+            await _run_ff(
+                ffmpeg.input(src, ss=start, t=30)
+                .output(out, **{"c:v":"libx264","preset":"fast","crf":"28",
+                                "c:a":"aac","b:a":"128k","movflags":"+faststart"})
             )
+        except Exception as e:
+            return await msg.edit(f"❌ Failed:\n`{e}`")
 
-    # ── /screenshot ───────────────────────────────────────────────────────────
+        if not os.path.exists(out):
+            return await msg.edit("❌ Sample generation failed.")
 
-    @app.on_message(filters.command("screenshot"))
-    async def cmd_screenshot(client: Client, message: Message):
-        u = message.from_user
-        await db.ensure_user(u.id, u.username, u.full_name)
-        allowed, used, limit = await db.check_and_consume(u.id, "media")
-        if err := _limit_err(allowed, used, limit):
-            await message.reply(err)
-            return
+        await msg.delete()
+        await message.reply_video(
+            video=out,
+            caption=f"🎬 **[#Sample]** `{label}`",
+            supports_streaming=True,
+        )
 
-        args = message.command[1:]
 
-        if args and args[0].startswith("http"):
-            wait  = await message.reply("⏳ Taking screenshots from URL…")
-            info  = await _ydl_stream_url(args[0])
-            label = args[0].split("?")[0].split("/")[-1][:40] or "video"
-            await _take_shots(client, message, wait, info, label)
-            return
+# ── /screenshot ────────────────────────────────────────────────────────────────
 
-        media_obj, fname, fsize = _get_video_from_reply(message)
-        if not media_obj:
-            await message.reply(
-                f"↩️ Reply to a video with `/screenshot`, or:\n`/screenshot <url>`"
-            )
-            return
+@Client.on_message(filters.command("screenshot"))
+async def cmd_screenshot(client: Client, message: Message):
+    u = message.from_user
+    await db.ensure_user(u.id, u.username, u.first_name or "")
+    allowed, used, limit = await db.check_and_consume(u.id, "media")
+    if err := _limit_msg(allowed, used, limit):
+        return await message.reply(err)
 
-        size_str = f"{fsize/1024/1024:.1f} MB" if fsize else "unknown size"
-        wait     = await message.reply(f"⏳ Downloading ({size_str}) and taking {SCREENSHOT_COUNT} screenshots…")
+    args = message.command[1:]
+    if args and args[0].startswith("http"):
+        msg   = await message.reply("⏳ Taking screenshots from URL…")
+        src   = await _ydl_stream_url(args[0])
+        label = args[0].split("?")[0].split("/")[-1][:40] or "video"
+        return await _take_screenshots(message, msg, src, label)
 
-        with tempfile.TemporaryDirectory() as tmp:
+    replied = message.reply_to_message
+    if not replied:
+        return await message.reply("↩️ Reply to a video with `/screenshot`, or:\n`/screenshot <url>`")
+
+    file_id, name, size, mime = _get_media(replied)
+    if not file_id:
+        return await message.reply("❌ Reply to a video or video file.")
+
+    msg = await message.reply(f"⏳ Taking {SCREENSHOT_COUNT} screenshots…")
+    src = _internal_stream_url(file_id, size, mime, name)
+    await _take_screenshots(message, msg, src, os.path.splitext(name)[0])
+
+
+async def _take_screenshots(message: Message, msg, src: str, label: str):
+    with tempfile.TemporaryDirectory() as tmp:
+        data   = await asyncio.to_thread(_probe, src)
+        dur    = _dur(data)
+        if dur < 10:
+            return await msg.edit("❌ Video is too short.")
+
+        margin = dur * 0.05
+        step   = (dur - 2 * margin) / SCREENSHOT_COUNT
+        times  = [margin + step * i for i in range(SCREENSHOT_COUNT)]
+        labels = [f"{int(t)}s" for t in times]
+
+        async def _shot(i: int, t: float) -> str | None:
+            path = os.path.join(tmp, f"shot_{i:02d}.jpg")
             try:
-                path = await _download_tg(client, media_obj, tmp, fname)
-            except Exception as e:
-                await wait.edit(f"❌ Download failed:\n`{e}`")
-                return
-            await _take_shots(client, message, wait, {"single": path},
-                              os.path.splitext(fname)[0])
+                await _run_ff(ffmpeg.input(src, ss=t).output(path, vframes=1, **{"q:v":"2"}))
+                return path if os.path.exists(path) else None
+            except Exception:
+                return None
 
-    async def _take_shots(client, message, wait, stream_info, label):
-        with tempfile.TemporaryDirectory() as tmp:
-            src  = stream_info.get("single") or stream_info.get("video")
-            data = await asyncio.to_thread(_probe, src)
-            dur  = _duration(data)
-            if dur < 10:
-                await wait.edit("❌ Video is too short.")
-                return
+        shots = await asyncio.gather(*[_shot(i, t) for i, t in enumerate(times)])
+        shots = [s for s in shots if s]
+        if not shots:
+            return await msg.edit("❌ Could not generate screenshots.")
 
-            margin = dur * 0.05
-            step   = (dur - 2 * margin) / SCREENSHOT_COUNT
-            times  = [margin + step * i for i in range(SCREENSHOT_COUNT)]
-            labels = [f"{int(t)}s" for t in times]
-
-            async def _shot(i: int, t: float) -> str | None:
-                path = os.path.join(tmp, f"shot_{i:02d}.jpg")
-                try:
-                    node = ffmpeg.input(src, ss=t).output(path, vframes=1, **{"q:v": "2"})
-                    await _run_ff(node)
-                    return path if os.path.exists(path) else None
-                except Exception:
-                    return None
-
-            shots = await asyncio.gather(*[_shot(i, t) for i, t in enumerate(times)])
-            shots = [s for s in shots if s]
-            if not shots:
-                await wait.edit("❌ Could not generate screenshots.")
-                return
-
-            caption = f"📸 *[#Screenshot]* At {', '.join(labels)}\n`{label}`"
-            media   = []
-            for i, shot in enumerate(shots):
-                media.append(InputMediaPhoto(
-                    shot,
-                    caption=caption if i == 0 else "",
-                ))
-
-            await wait.delete()
-            await client.send_media_group(message.chat.id, media)
+        caption = f"📸 **[#Screenshot]** At {', '.join(labels)}\n`{label}`"
+        media   = [InputMediaPhoto(s, caption=caption if i == 0 else "")
+                   for i, s in enumerate(shots)]
+        await msg.delete()
+        await message.reply_media_group(media)

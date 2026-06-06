@@ -1,145 +1,75 @@
-"""
-handlers/link.py
-Command: /link  (reply to any file / video / audio)
-
-With Pyrogram (API_ID + API_HASH configured):
-  → uses ByteStreamer MTProto path — NO file size limit (up to 4 GB)
-
-Without STREAM_BASE_URL:
-  → sends the raw Telegram CDN URL directly
-"""
-
 from mimetypes import guess_type
-
 from pyrogram import Client, filters
-from pyrogram.types import (
-    Message, InlineKeyboardMarkup, InlineKeyboardButton,
-)
-
+from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
 import database as db
-import pyrogram_helper as pyro
-from config import BOT_TOKEN, STREAM_BASE_URL
-from stream_server import LINK_TTL, create_token
+from config import STREAM_BASE_URL, STREAM_PORT
+from stream_server import create_token, LINK_TTL
 
 
 def _human_size(n: int) -> str:
-    for unit in ("B", "KB", "MB", "GB"):
-        if n < 1024:
-            return f"{n:.1f} {unit}"
+    for u in ("B","KB","MB","GB"):
+        if n < 1024: return f"{n:.1f} {u}"
         n /= 1024
     return f"{n:.1f} TB"
 
 
-def register(app: Client):
+def _get_file(message: Message):
+    if message.video:
+        v = message.video
+        return v.file_id, (v.file_name or "video.mp4"), (v.file_size or 0), (v.mime_type or "video/mp4")
+    if message.document:
+        d = message.document
+        return d.file_id, (d.file_name or "file"), (d.file_size or 0), (d.mime_type or guess_type(d.file_name or "")[0] or "application/octet-stream")
+    if message.audio:
+        a = message.audio
+        return a.file_id, (a.file_name or "audio.mp3"), (a.file_size or 0), (a.mime_type or "audio/mpeg")
+    return None, None, 0, None
 
-    @app.on_message(filters.command("link"))
-    async def cmd_link(client: Client, message: Message):
-        u = message.from_user
-        await db.ensure_user(u.id, u.username, u.full_name)
 
-        r = message.reply_to_message
-        if not r:
-            await message.reply(
-                "↩️ Reply to any file, video or audio with `/link` "
-                "to get a stream + download link."
-            )
-            return
+@Client.on_message(filters.command("link"))
+async def cmd_link(client: Client, message: Message):
+    u = message.from_user
+    await db.ensure_user(u.id, u.username, u.first_name or "")
 
-        # Identify the file object
-        media_obj = filename = mime = None
-        size = 0
+    replied = message.reply_to_message
+    if not replied:
+        return await message.reply(
+            "↩️ Reply to any file, video or audio with `/link` to generate stream + download links."
+        )
 
-        if r.video:
-            media_obj = r.video
-            filename  = r.video.file_name  or "video.mp4"
-            size      = r.video.file_size  or 0
-            mime      = r.video.mime_type  or "video/mp4"
-        elif r.document:
-            media_obj = r.document
-            filename  = r.document.file_name or "file"
-            size      = r.document.file_size or 0
-            mime      = r.document.mime_type or guess_type(r.document.file_name or "")[0] or "application/octet-stream"
-        elif r.audio:
-            media_obj = r.audio
-            filename  = r.audio.file_name  or "audio.mp3"
-            size      = r.audio.file_size  or 0
-            mime      = r.audio.mime_type  or "audio/mpeg"
+    file_id, name, size, mime = _get_file(replied)
+    if not file_id:
+        return await message.reply("❌ Reply to a video, document or audio file.")
 
-        if not media_obj:
-            await message.reply("❌ Reply to a video, document, or audio file.")
-            return
+    proc = await message.reply("⏳ Generating link…")
 
-        wait     = await message.reply("⏳ Generating link…")
-        size_str = _human_size(size)
+    token     = create_token(name, size, mime, tg_file_id=file_id)
+    size_str  = _human_size(size)
 
-        # ── Path A: Pyrogram available — unlimited size ────────────────────────
-        if pyro.is_available():
-            tg_file_id = media_obj.file_id
+    if STREAM_BASE_URL:
+        base      = STREAM_BASE_URL.rstrip("/")
+        watch_url = f"{base}/watch/{token}"
+        dl_url    = f"{base}/dl/{token}"
 
-            if STREAM_BASE_URL:
-                token     = create_token(filename, size, mime, tg_file_id=tg_file_id)
-                base      = STREAM_BASE_URL.rstrip("/")
-                watch_url = f"{base}/watch/{token}"
-                dl_url    = f"{base}/dl/{token}"
-
-                text = (
-                    f"🔗 *{filename}*\n\n"
-                    f"💾 Size    : `{size_str}`\n"
-                    f"📁 Type    : `{mime}`\n"
-                    f"🚀 Backend : `Pyrogram MTProto`\n\n"
-                    f"⏳ _Links expire in {LINK_TTL // 3600}h_"
-                )
-                buttons = [[
-                    InlineKeyboardButton("▶️ Watch Online", url=watch_url),
-                    InlineKeyboardButton("⬇️ Download",     url=dl_url),
-                ]]
-                await wait.delete()
-                await message.reply(text, reply_markup=InlineKeyboardMarkup(buttons))
-            else:
-                await wait.edit(
-                    f"🔗 *{filename}*\n"
-                    f"💾 Size: `{size_str}` | Pyrogram: ✅\n\n"
-                    "Set `STREAM_BASE_URL` in `.env` to generate Watch/Download links.\n\n"
-                    "Example:\n`STREAM_BASE_URL=http://YOUR_SERVER_IP:8080`"
-                )
-            return
-
-        # ── Path B: No Pyrogram — CDN proxy (≤ 20 MB) ────────────────────────
-        try:
-            tg_file = await client.get_file(media_obj.file_id)
-            cdn_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{tg_file.file_path}"
-        except Exception:
-            await wait.edit(
-                f"❌ *File too large* ({size_str}) for the Bot API (20 MB limit).\n\n"
-                "To stream large files, add your Telegram API credentials to `.env`:\n"
-                "```\nAPI_ID=your_api_id\nAPI_HASH=your_api_hash\n```\n"
-                "Get them from https://my.telegram.org/apps"
-            )
-            return
-
-        if STREAM_BASE_URL:
-            token     = create_token(filename, size, mime, cdn_url=cdn_url)
-            base      = STREAM_BASE_URL.rstrip("/")
-            watch_url = f"{base}/watch/{token}"
-            dl_url    = f"{base}/dl/{token}"
-
-            text = (
-                f"🔗 *{filename}*\n\n"
-                f"💾 Size    : `{size_str}`\n"
-                f"📁 Type    : `{mime}`\n"
-                f"🔌 Backend : `CDN Proxy`\n\n"
-                f"⏳ _Links expire in {LINK_TTL // 3600}h_"
-            )
-            buttons = [[
-                InlineKeyboardButton("▶️ Watch Online", url=watch_url),
-                InlineKeyboardButton("⬇️ Download",     url=dl_url),
-            ]]
-            await wait.delete()
-            await message.reply(text, reply_markup=InlineKeyboardMarkup(buttons))
-        else:
-            await wait.edit(
-                f"🔗 *{filename}*\n"
-                f"💾 Size: `{size_str}`\n\n"
-                f"⬇️ Direct link (⏳ ~1 h):\n`{cdn_url}`\n\n"
-                "_Set `STREAM_BASE_URL` for proper Watch/Download pages._"
-            )
+        text = (
+            f"🔗 **{name}**\n\n"
+            f"💾 Size : `{size_str}`\n"
+            f"📁 Type : `{mime}`\n"
+            f"🚀 Backend : `Pyrogram MTProto`\n\n"
+            f"⏳ _Links expire in {LINK_TTL // 3600}h_"
+        )
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("▶️ Watch Online", url=watch_url),
+            InlineKeyboardButton("⬇️ Download",     url=dl_url),
+        ]])
+        await proc.delete()
+        await message.reply(text, reply_markup=kb)
+    else:
+        # Stream server running on localhost only — use internal URL for now
+        dl_url = f"http://127.0.0.1:{STREAM_PORT}/dl/{token}"
+        await proc.edit(
+            f"🔗 **{name}**\n"
+            f"💾 Size: `{size_str}` | Backend: `Pyrogram MTProto ✅`\n\n"
+            "⚠️ Set `STREAM_BASE_URL` in `.env` to generate public Watch/Download links.\n\n"
+            "Example:\n`STREAM_BASE_URL=http://YOUR_VPS_IP:8080`"
+        )
