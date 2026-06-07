@@ -1,37 +1,157 @@
 """
-stream_server.py  —  aiohttp HTTP server for file streaming.
+stream_server.py
 
-Always starts on localhost so ffmpeg can access ANY Telegram file
-(any size) via http://127.0.0.1:PORT/dl/TOKEN with Range support.
+aiohttp streaming server.
+  - Pyrogram available → ByteStreamer via raw MTProto (any file size, up to 4 GB)
+  - Fallback           → CDN proxy (≤ 20 MB Bot API limit)
 
-Public URLs (STREAM_BASE_URL) are only used for /link command output.
+Endpoints:
+  GET /watch/{token}  → HTML player page
+  GET /dl/{token}     → raw bytes, range-aware
 """
 
 import logging
 import mimetypes
 import secrets
 import time
-from pathlib import Path
 from typing import Optional
 
 from aiohttp import web, ClientSession
 
-log      = logging.getLogger(__name__)
+logger = logging.getLogger(__name__)
+
 _TOKENS: dict[str, dict] = {}
-LINK_TTL = 3600
-_TEMPLATE = (Path(__file__).parent / "templates" / "watch.html").read_text()
+LINK_TTL = 3600   # 1 hour
 
-_pyro_client = None     # set on startup
+# ── Inline watch page — no external file dependency ───────────────────────────
+# Placeholders filled at request time:
+#   {title}  {filename}  {size}  {mime}  {tag}  {dl_url}
+_TEMPLATE = """<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>{title}</title>
+  <style>
+    *, *::before, *::after {{ box-sizing: border-box; margin: 0; padding: 0; }}
+    body {{
+      min-height: 100vh;
+      background: #0f0f0f;
+      color: #e0e0e0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 24px 16px;
+      gap: 20px;
+    }}
+    header {{
+      width: 100%;
+      max-width: 860px;
+      border-bottom: 1px solid #2a2a2a;
+      padding-bottom: 12px;
+    }}
+    header h1 {{
+      font-size: 1.1rem;
+      font-weight: 600;
+      color: #fff;
+      word-break: break-all;
+    }}
+    header p {{
+      font-size: 0.82rem;
+      color: #888;
+      margin-top: 4px;
+    }}
+    .player-wrap {{
+      width: 100%;
+      max-width: 860px;
+      background: #1a1a1a;
+      border-radius: 12px;
+      overflow: hidden;
+      box-shadow: 0 8px 32px rgba(0,0,0,.6);
+    }}
+    {tag} {{
+      width: 100%;
+      display: block;
+      max-height: 72vh;
+      background: #000;
+    }}
+    .actions {{
+      display: flex;
+      gap: 12px;
+      flex-wrap: wrap;
+      width: 100%;
+      max-width: 860px;
+    }}
+    a.btn {{
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 10px 20px;
+      border-radius: 8px;
+      font-size: 0.9rem;
+      font-weight: 500;
+      text-decoration: none;
+      transition: opacity .15s;
+    }}
+    a.btn:hover {{ opacity: .85; }}
+    .btn-dl  {{ background: #2563eb; color: #fff; }}
+    .btn-cp  {{ background: #1f2937; color: #e0e0e0; border: 1px solid #374151; cursor: pointer; }}
+    footer {{
+      font-size: 0.75rem;
+      color: #444;
+      margin-top: auto;
+    }}
+  </style>
+</head>
+<body>
+  <header>
+    <h1>📄 {filename}</h1>
+    <p>Size: {size} &nbsp;•&nbsp; Type: {mime}</p>
+  </header>
+
+  <div class="player-wrap">
+    <{tag} controls preload="metadata" src="{dl_url}">
+      Your browser does not support this media type.
+    </{tag}>
+  </div>
+
+  <div class="actions">
+    <a class="btn btn-dl" href="{dl_url}" download="{filename}">⬇️ Download</a>
+    <a class="btn btn-cp" onclick="copyLink(this)">🔗 Copy Link</a>
+  </div>
+
+  <footer>Link expires in 1 hour &nbsp;•&nbsp; Powered by the bot</footer>
+
+  <script>
+    function copyLink(btn) {{
+      navigator.clipboard.writeText('{dl_url}').then(() => {{
+        btn.textContent = '✅ Copied!';
+        setTimeout(() => btn.textContent = '🔗 Copy Link', 2000);
+      }});
+    }}
+    // Attempt to resume from last position via localStorage
+    const player = document.querySelector('video, audio');
+    const key = 'pos_{title}';
+    if (player) {{
+      const saved = parseFloat(localStorage.getItem(key) || '0');
+      if (saved > 2) player.currentTime = saved;
+      player.addEventListener('timeupdate', () => {{
+        if (!player.paused) localStorage.setItem(key, player.currentTime);
+      }});
+    }}
+  </script>
+</body>
+</html>"""
 
 
-def set_pyrogram_client(client):
-    global _pyro_client
-    _pyro_client = client
-
-
-def create_token(filename: str, size: int, mime: str,
-                 tg_file_id: Optional[str] = None,
-                 cdn_url:    Optional[str] = None) -> str:
+def create_token(
+    filename:   str,
+    size:       int,
+    mime:       str,
+    tg_file_id: Optional[str] = None,
+    cdn_url:    Optional[str] = None,
+) -> str:
     token = secrets.token_urlsafe(14)
     _TOKENS[token] = {
         "tg_file_id": tg_file_id,
@@ -50,9 +170,9 @@ def _entry(token: str) -> Optional[dict]:
 
 
 def _human_size(n: int) -> str:
-    for u in ("B", "KB", "MB", "GB"):
+    for unit in ("B", "KB", "MB", "GB"):
         if n < 1024:
-            return f"{n:.1f} {u}"
+            return f"{n:.1f} {unit}"
         n /= 1024
     return f"{n:.1f} TB"
 
@@ -75,8 +195,8 @@ async def watch_handler(request: web.Request):
     mime   = e["mime"]
     tag    = "video" if mime.startswith("video") else "audio" if mime.startswith("audio") else "video"
     html   = _TEMPLATE.format(
-        file_name=e["filename"], file_url=dl_url,
-        file_size=_human_size(e["size"]), tag=tag,
+        title=e["filename"], filename=e["filename"],
+        size=_human_size(e["size"]), mime=mime, tag=tag, dl_url=dl_url,
     )
     return web.Response(text=html, content_type="text/html")
 
@@ -91,45 +211,51 @@ async def dl_handler(request: web.Request):
     range_hdr = request.headers.get("Range", "")
 
     if range_hdr:
-        parts       = range_hdr.replace("bytes=", "").split("-", 1)
+        rng   = range_hdr.replace("bytes=", "")
+        parts = rng.split("-", 1)
         from_bytes  = int(parts[0]) if parts[0] else 0
         until_bytes = int(parts[1]) if len(parts) > 1 and parts[1] else file_size - 1
     else:
-        from_bytes, until_bytes = 0, file_size - 1
+        from_bytes  = 0
+        until_bytes = file_size - 1
 
     until_bytes = min(until_bytes, file_size - 1)
-    req_length  = until_bytes - from_bytes + 1
-    status      = 206 if range_hdr else 200
+    if from_bytes < 0 or until_bytes < from_bytes or until_bytes >= file_size:
+        return web.Response(
+            status=416, text="Range Not Satisfiable",
+            headers={"Content-Range": f"bytes */{file_size}"},
+        )
 
+    req_length = until_bytes - from_bytes + 1
+    status     = 206 if range_hdr else 200
     resp_headers = {
         "Content-Type":        e["mime"],
         "Content-Length":      str(req_length),
         "Content-Range":       f"bytes {from_bytes}-{until_bytes}/{file_size}",
         "Content-Disposition": f'inline; filename="{e["filename"]}"',
         "Accept-Ranges":       "bytes",
+        "Cache-Control":       "public, max-age=3600",
     }
 
-    # ── Pyrogram ByteStreamer (any size, fast) ────────────────────────────────
-    if _pyro_client and e.get("tg_file_id"):
-        if not hasattr(_pyro_client, "_streamer"):
-            from utils.byte_streamer import ByteStreamer
-            _pyro_client._streamer = ByteStreamer(_pyro_client)
-
-        body = _pyro_client._streamer.stream_file(
+    # Backend A: Pyrogram ByteStreamer
+    import pyrogram_helper as pyro
+    if pyro.is_available() and e.get("tg_file_id"):
+        streamer = pyro.get_streamer()
+        body = streamer.stream_file(
             tg_file_id=e["tg_file_id"], file_size=file_size,
-            mime=e["mime"], name=e["filename"],
+            mime_type=e["mime"], file_name=e["filename"],
             from_bytes=from_bytes, until_bytes=until_bytes,
         )
         return web.Response(status=status, body=body, headers=resp_headers)
 
-    # ── CDN proxy fallback (≤ 20 MB) ─────────────────────────────────────────
+    # Backend B: CDN proxy fallback
     cdn_url = e.get("cdn_url")
     if not cdn_url:
-        return web.Response(status=503, text="No backend available.")
+        return web.Response(status=503, text="File not accessible.")
 
-    fwd = {"Range": range_hdr} if range_hdr else {}
-    async with ClientSession() as sess:
-        async with sess.get(cdn_url, headers=fwd) as tg:
+    fwd_headers = {"Range": range_hdr} if range_hdr else {}
+    async with ClientSession() as session:
+        async with session.get(cdn_url, headers=fwd_headers) as tg:
             resp = web.StreamResponse(status=tg.status, headers=resp_headers)
             await resp.prepare(request)
             async for chunk in tg.content.iter_chunked(512 * 1024):
@@ -140,16 +266,14 @@ async def dl_handler(request: web.Request):
 _runner: Optional[web.AppRunner] = None
 
 
-async def start_stream_server(port: int, pyro_client=None):
+async def start_stream_server(port: int):
     global _runner
-    if pyro_client:
-        set_pyrogram_client(pyro_client)
     app = web.Application()
     app.add_routes(routes)
     _runner = web.AppRunner(app)
     await _runner.setup()
     await web.TCPSite(_runner, "0.0.0.0", port).start()
-    log.info("Stream server on port %d", port)
+    logger.info("Stream server started on port %d", port)
 
 
 async def stop_stream_server():

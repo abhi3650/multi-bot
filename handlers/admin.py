@@ -1,102 +1,160 @@
+"""
+handlers/admin.py  —  Admin-only commands
+/restart  /addpremium  /removepremium  /pending  /stats  /broadcast
+"""
+
 import asyncio
 import os
 import sys
 import time
 
 from pyrogram import Client, filters
-from pyrogram.types import Message
+from pyrogram.enums import ParseMode
+from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
 
 import database as db
 from config import ADMIN_IDS, PREMIUM_DAYS
 
-admin_filter = filters.user(ADMIN_IDS) if ADMIN_IDS else filters.user([])
+MD = ParseMode.MARKDOWN
 
 
-@Client.on_message(filters.command("restart") & admin_filter)
-async def cmd_restart(client: Client, message: Message):
-    await message.reply("♻️ Restarting…")
-    os.execv(sys.executable, [sys.executable] + sys.argv)
+def _admin_filter(_, __, message: Message) -> bool:
+    return (message.from_user is not None) and (message.from_user.id in ADMIN_IDS)
+
+admin_only = filters.create(_admin_filter)
 
 
-@Client.on_message(filters.command("addpremium") & admin_filter)
-async def cmd_addpremium(client: Client, message: Message):
-    args = message.command[1:]
-    if not args:
-        return await message.reply("Usage: `/addpremium <user_id> [days]`")
-    try:
-        uid  = int(args[0])
-        days = int(args[1]) if len(args) > 1 else PREMIUM_DAYS
-    except ValueError:
-        return await message.reply("❌ Invalid arguments.")
+def register(app: Client):
 
-    await db.grant_premium(uid, days)
-    exp = time.strftime("%d %b %Y", time.localtime(time.time() + days * 86400))
-    await message.reply(f"✅ Premium granted to `{uid}` for **{days} days** (expires {exp}).")
-    try:
-        await client.send_message(uid,
-            f"🎉 **Premium Activated!**\n\nYour membership is now active for **{days} days** (expires {exp}).\nEnjoy unlimited access! ⭐")
-    except Exception:
-        pass
+    # ── /restart ──────────────────────────────────────────────────────────────
+    @app.on_message(filters.command("restart") & admin_only)
+    async def cmd_restart(client: Client, message: Message):
+        await message.reply("♻️ Restarting bot…")
+        os.execv(sys.executable, [sys.executable] + sys.argv)
 
-
-@Client.on_message(filters.command("removepremium") & admin_filter)
-async def cmd_removepremium(client: Client, message: Message):
-    args = message.command[1:]
-    if not args:
-        return await message.reply("Usage: `/removepremium <user_id>`")
-    try:
-        uid = int(args[0])
-    except ValueError:
-        return await message.reply("❌ Invalid user ID.")
-    await db.revoke_premium(uid)
-    await message.reply(f"✅ Premium removed from `{uid}`.")
-
-
-@Client.on_message(filters.command("pending") & admin_filter)
-async def cmd_pending(client: Client, message: Message):
-    rows = await db.get_pending()
-    if not rows:
-        return await message.reply("✅ No pending premium verifications.")
-    lines = ["📋 **Pending Premium Requests:**\n"]
-    for r in rows:
-        ts = time.strftime("%d %b %Y %H:%M", time.localtime(r["requested_at"]))
-        lines.append(f"• User `{r['user_id']}` — UTR: `{r['utr']}`\n  Requested: {ts}\n  → `/addpremium {r['user_id']}` to approve")
-    await message.reply("\n".join(lines))
-
-
-@Client.on_message(filters.command("stats") & admin_filter)
-async def cmd_stats(client: Client, message: Message):
-    all_ids = await db.get_all_users()
-    premium = sum(1 for uid in all_ids if await db.is_premium(uid))
-    await message.reply(
-        f"📊 **Bot Statistics**\n\n"
-        f"👥 Total Users  : `{len(all_ids)}`\n"
-        f"⭐ Premium Users: `{premium}`\n"
-        f"👤 Free Users   : `{len(all_ids) - premium}`"
-    )
-
-
-@Client.on_message(filters.command("broadcast") & admin_filter)
-async def cmd_broadcast(client: Client, message: Message):
-    args = message.command[1:]
-    if not args:
-        return await message.reply("Usage: `/broadcast <message>`\n_Supports Markdown formatting._")
-
-    text    = " ".join(args)
-    all_ids = await db.get_all_users()
-    msg     = await message.reply(f"📤 Broadcasting to {len(all_ids)} users…")
-    sent = failed = 0
-
-    for uid in all_ids:
+    # ── /addpremium ───────────────────────────────────────────────────────────
+    @app.on_message(filters.command("addpremium") & admin_only)
+    async def cmd_addpremium(client: Client, message: Message):
+        args = message.command[1:]
+        if not args:
+            await message.reply(
+                "**Usage:** `/addpremium <user_id> [days]`\n"
+                "**Example:** `/addpremium 123456789 30`",
+                parse_mode=MD,
+            )
+            return
         try:
-            await client.send_message(uid, text)
-            sent += 1
-        except Exception:
-            failed += 1
-        await asyncio.sleep(0.05)
+            uid  = int(args[0])
+            days = int(args[1]) if len(args) > 1 else PREMIUM_DAYS
+        except ValueError:
+            await message.reply("❌ Invalid arguments. User ID must be a number.")
+            return
 
-    await msg.edit(
-        f"✅ **Broadcast done!**\n"
-        f"• Sent   : `{sent}`\n"
-        f"• Failed : `{failed}`"
-    )
+        await db.grant_premium(uid, days)
+        exp = time.strftime("%d %b %Y", time.localtime(time.time() + days * 86400))
+
+        await message.reply(
+            f"✅ **Premium granted!**\n\n"
+            f"👤 User   : `{uid}`\n"
+            f"📅 Period : **{days} days**\n"
+            f"⏳ Expires: {exp}",
+            parse_mode=MD,
+        )
+        try:
+            await client.send_message(
+                uid,
+                f"🎉 **Premium Activated!**\n\n"
+                f"Your Premium membership is now active for **{days} days** "
+                f"(expires {exp}).\n\n"
+                "Enjoy unlimited access! ⭐",
+                parse_mode=MD,
+            )
+        except Exception:
+            pass
+
+    # ── /removepremium ────────────────────────────────────────────────────────
+    @app.on_message(filters.command("removepremium") & admin_only)
+    async def cmd_removepremium(client: Client, message: Message):
+        args = message.command[1:]
+        if not args:
+            await message.reply(
+                "**Usage:** `/removepremium <user_id>`",
+                parse_mode=MD,
+            )
+            return
+        try:
+            uid = int(args[0])
+        except ValueError:
+            await message.reply("❌ Invalid user ID. Must be a number.")
+            return
+
+        await db.revoke_premium(uid)
+        await message.reply(
+            f"✅ Premium removed from `{uid}`.",
+            parse_mode=MD,
+        )
+
+    # ── /pending ──────────────────────────────────────────────────────────────
+    @app.on_message(filters.command("pending") & admin_only)
+    async def cmd_pending(client: Client, message: Message):
+        rows = await db.get_pending()
+        if not rows:
+            await message.reply("✅ No pending premium verifications.")
+            return
+
+        lines = ["📋 **Pending Premium Requests**\n"]
+        for r in rows:
+            ts = time.strftime("%d %b %Y %H:%M", time.localtime(r["requested_at"]))
+            lines.append(
+                f"👤 User `{r['user_id']}`\n"
+                f"   UTR: `{r['utr']}`\n"
+                f"   At : {ts}\n"
+                f"   ✅ `/addpremium {r['user_id']}` to approve\n"
+            )
+        await message.reply("\n".join(lines), parse_mode=MD)
+
+    # ── /stats ────────────────────────────────────────────────────────────────
+    @app.on_message(filters.command("stats") & admin_only)
+    async def cmd_stats(client: Client, message: Message):
+        all_ids = await db.get_all_users()
+        prem    = sum(1 for uid in all_ids if await db.is_premium(uid))
+        free    = len(all_ids) - prem
+        await message.reply(
+            "📊 **Bot Statistics**\n\n"
+            f"👥 Total Users   : `{len(all_ids)}`\n"
+            f"⭐ Premium Users  : `{prem}`\n"
+            f"👤 Free Users    : `{free}`",
+            parse_mode=MD,
+        )
+
+    # ── /broadcast ────────────────────────────────────────────────────────────
+    @app.on_message(filters.command("broadcast") & admin_only)
+    async def cmd_broadcast(client: Client, message: Message):
+        args = message.command[1:]
+        if not args:
+            await message.reply(
+                "**Usage:** `/broadcast <message>`\n"
+                "_Sends the message to every user._",
+                parse_mode=MD,
+            )
+            return
+
+        text    = " ".join(args)
+        all_ids = await db.get_all_users()
+        status  = await message.reply(f"📤 Broadcasting to **{len(all_ids)}** users…", parse_mode=MD)
+
+        sent = failed = 0
+        for uid in all_ids:
+            try:
+                await client.send_message(uid, text)
+                sent += 1
+            except Exception:
+                failed += 1
+            await asyncio.sleep(0.05)
+
+        await status.edit(
+            "✅ **Broadcast complete!**\n\n"
+            f"📨 Sent   : `{sent}`\n"
+            f"❌ Failed : `{failed}`",
+            parse_mode=MD,
+        )

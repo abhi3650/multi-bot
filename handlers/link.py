@@ -1,75 +1,153 @@
+"""
+handlers/link.py  —  /link command
+Reply to any file/video/audio to get Watch Online + Download links.
+
+Pyrogram available (API_ID+API_HASH set)  → MTProto streaming, any file size
+Pyrogram unavailable                       → CDN proxy (≤ 20 MB Bot API cap)
+"""
+
 from mimetypes import guess_type
+
 from pyrogram import Client, filters
+from pyrogram.enums import ParseMode
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
+
 import database as db
-from config import STREAM_BASE_URL, STREAM_PORT
-from stream_server import create_token, LINK_TTL
+import pyrogram_helper as pyro
+from config import BOT_TOKEN, STREAM_BASE_URL
+from stream_server import LINK_TTL, create_token
+
+MD = ParseMode.MARKDOWN
+
+
+def _full_name(u) -> str:
+    parts = [u.first_name or "", u.last_name or ""]
+    return " ".join(p for p in parts if p).strip() or "Unknown"
 
 
 def _human_size(n: int) -> str:
-    for u in ("B","KB","MB","GB"):
-        if n < 1024: return f"{n:.1f} {u}"
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024:
+            return f"{n:.1f} {unit}"
         n /= 1024
     return f"{n:.1f} TB"
 
 
-def _get_file(message: Message):
-    if message.video:
-        v = message.video
-        return v.file_id, (v.file_name or "video.mp4"), (v.file_size or 0), (v.mime_type or "video/mp4")
-    if message.document:
-        d = message.document
-        return d.file_id, (d.file_name or "file"), (d.file_size or 0), (d.mime_type or guess_type(d.file_name or "")[0] or "application/octet-stream")
-    if message.audio:
-        a = message.audio
-        return a.file_id, (a.file_name or "audio.mp3"), (a.file_size or 0), (a.mime_type or "audio/mpeg")
-    return None, None, 0, None
+def register(app: Client):
 
+    @app.on_message(filters.command("link"))
+    async def cmd_link(client: Client, message: Message):
+        u = message.from_user
+        await db.ensure_user(u.id, u.username, _full_name(u))
 
-@Client.on_message(filters.command("link"))
-async def cmd_link(client: Client, message: Message):
-    u = message.from_user
-    await db.ensure_user(u.id, u.username, u.first_name or "")
+        r = message.reply_to_message
+        if not r:
+            await message.reply(
+                "↩️ **How to use /link**\n\n"
+                "Reply to any **video**, **document**, or **audio** file with `/link`\n"
+                "to get a **Watch Online** + **Download** link.\n\n"
+                "📌 _Links expire after 1 hour._",
+                parse_mode=MD,
+            )
+            return
 
-    replied = message.reply_to_message
-    if not replied:
-        return await message.reply(
-            "↩️ Reply to any file, video or audio with `/link` to generate stream + download links."
-        )
+        # ── Identify media object ──────────────────────────────────────────────
+        media_obj = filename = mime = None
+        size = 0
 
-    file_id, name, size, mime = _get_file(replied)
-    if not file_id:
-        return await message.reply("❌ Reply to a video, document or audio file.")
+        if r.video:
+            media_obj = r.video
+            filename  = r.video.file_name or "video.mp4"
+            size      = r.video.file_size or 0
+            mime      = r.video.mime_type or "video/mp4"
+        elif r.document:
+            media_obj = r.document
+            filename  = r.document.file_name or "file"
+            size      = r.document.file_size or 0
+            mime      = (r.document.mime_type
+                         or guess_type(r.document.file_name or "")[0]
+                         or "application/octet-stream")
+        elif r.audio:
+            media_obj = r.audio
+            filename  = r.audio.file_name or "audio.mp3"
+            size      = r.audio.file_size or 0
+            mime      = r.audio.mime_type or "audio/mpeg"
 
-    proc = await message.reply("⏳ Generating link…")
+        if not media_obj:
+            await message.reply("❌ Please reply to a **video**, **document**, or **audio** file.", parse_mode=MD)
+            return
 
-    token     = create_token(name, size, mime, tg_file_id=file_id)
-    size_str  = _human_size(size)
+        wait     = await message.reply("⏳ Generating link…")
+        size_str = _human_size(size)
 
-    if STREAM_BASE_URL:
-        base      = STREAM_BASE_URL.rstrip("/")
-        watch_url = f"{base}/watch/{token}"
-        dl_url    = f"{base}/dl/{token}"
+        # ── Path A: Pyrogram MTProto — no size limit ───────────────────────────
+        if pyro.is_available():
+            if STREAM_BASE_URL:
+                token     = create_token(filename, size, mime, tg_file_id=media_obj.file_id)
+                base      = STREAM_BASE_URL.rstrip("/")
+                watch_url = f"{base}/watch/{token}"
+                dl_url    = f"{base}/dl/{token}"
 
-        text = (
-            f"🔗 **{name}**\n\n"
-            f"💾 Size : `{size_str}`\n"
-            f"📁 Type : `{mime}`\n"
-            f"🚀 Backend : `Pyrogram MTProto`\n\n"
-            f"⏳ _Links expire in {LINK_TTL // 3600}h_"
-        )
-        kb = InlineKeyboardMarkup([[
-            InlineKeyboardButton("▶️ Watch Online", url=watch_url),
-            InlineKeyboardButton("⬇️ Download",     url=dl_url),
-        ]])
-        await proc.delete()
-        await message.reply(text, reply_markup=kb)
-    else:
-        # Stream server running on localhost only — use internal URL for now
-        dl_url = f"http://127.0.0.1:{STREAM_PORT}/dl/{token}"
-        await proc.edit(
-            f"🔗 **{name}**\n"
-            f"💾 Size: `{size_str}` | Backend: `Pyrogram MTProto ✅`\n\n"
-            "⚠️ Set `STREAM_BASE_URL` in `.env` to generate public Watch/Download links.\n\n"
-            "Example:\n`STREAM_BASE_URL=http://YOUR_VPS_IP:8080`"
-        )
+                text = (
+                    f"🔗 **{filename}**\n\n"
+                    f"💾 Size    : `{size_str}`\n"
+                    f"📁 Type    : `{mime}`\n"
+                    f"🚀 Backend : `Pyrogram MTProto`\n\n"
+                    f"⏳ _Links expire in {LINK_TTL // 3600}h_"
+                )
+                buttons = [[
+                    InlineKeyboardButton("▶️ Watch Online", url=watch_url),
+                    InlineKeyboardButton("⬇️ Download",     url=dl_url),
+                ]]
+                await wait.delete()
+                await message.reply(text, parse_mode=MD, reply_markup=InlineKeyboardMarkup(buttons))
+            else:
+                await wait.edit(
+                    f"🔗 **{filename}** • `{size_str}` • Pyrogram ✅\n\n"
+                    "⚠️ Set `STREAM_BASE_URL` in your `.env` to enable Watch/Download pages.\n\n"
+                    "Example:\n`STREAM_BASE_URL=http://YOUR_SERVER_IP:8080`",
+                    parse_mode=MD,
+                )
+            return
+
+        # ── Path B: Bot API CDN proxy — ≤ 20 MB only ─────────────────────────
+        try:
+            tg_file = await client.get_file(media_obj.file_id)
+            cdn_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{tg_file.file_path}"
+        except Exception:
+            await wait.edit(
+                f"❌ **File too large** ({size_str}) for the Bot API 20 MB limit.\n\n"
+                "To stream large files, add your Telegram API credentials to `.env`:\n"
+                "`API_ID=your_api_id`\n"
+                "`API_HASH=your_api_hash`\n\n"
+                "Get them free at https://my.telegram.org/apps",
+                parse_mode=MD,
+            )
+            return
+
+        if STREAM_BASE_URL:
+            token     = create_token(filename, size, mime, cdn_url=cdn_url)
+            base      = STREAM_BASE_URL.rstrip("/")
+            watch_url = f"{base}/watch/{token}"
+            dl_url    = f"{base}/dl/{token}"
+
+            text = (
+                f"🔗 **{filename}**\n\n"
+                f"💾 Size    : `{size_str}`\n"
+                f"📁 Type    : `{mime}`\n"
+                f"🔌 Backend : `CDN Proxy`\n\n"
+                f"⏳ _Links expire in {LINK_TTL // 3600}h_"
+            )
+            buttons = [[
+                InlineKeyboardButton("▶️ Watch Online", url=watch_url),
+                InlineKeyboardButton("⬇️ Download",     url=dl_url),
+            ]]
+            await wait.delete()
+            await message.reply(text, parse_mode=MD, reply_markup=InlineKeyboardMarkup(buttons))
+        else:
+            await wait.edit(
+                f"🔗 **{filename}** • `{size_str}`\n\n"
+                f"⬇️ Direct link _(expires ~1h)_:\n`{cdn_url}`\n\n"
+                "_Tip: Set `STREAM_BASE_URL` for proper Watch/Download pages._",
+                parse_mode=MD,
+            )
