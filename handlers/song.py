@@ -82,7 +82,7 @@ def _embed(mp3_path: str, thumb_data: bytes, title: str, artist: str):
 
 def register(app: Client):
 
-    @app.on_message(filters.command("song"))
+    @app.on_message(filters.command("song") & filters.private)
     async def cmd_song(client: Client, message: Message):
         u = message.from_user
         await db.ensure_user(u.id, u.username, _full_name(u))

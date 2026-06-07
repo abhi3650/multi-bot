@@ -1,9 +1,18 @@
 """
 handlers/movie.py  —  /imdb  /ott  /posters
 
+/posters UI (matches the screenshots exactly):
+  Step 1 — Show movie title + "Select Poster Type" buttons:
+              [Landscape (N)]  [Portrait (N)]
+              [Clean Landscape (N)]
+              [Back]  [Close]
+  Step 2 — Browse within that type:
+              [<<]  [<]  [1/N]  [>]  [>>]
+              [Back]  [Close]
+
 OTT source priority:
   1. JustWatch GraphQL  (if JUSTWATCH_API env is set)
-  2. TMDB Watch Providers  (free, always available)
+  2. TMDB Watch Providers  (always available)
 """
 
 import logging
@@ -142,7 +151,6 @@ async def _ott_tmdb(hx: httpx.AsyncClient, mtype: str, tmdb_id: int,
     prov_data   = r.json().get("results", {})
     region_data = prov_data.get("IN") or prov_data.get("US") or {}
     jw_link     = region_data.get("link", "")
-
     providers: dict[str, list] = {}
     for key in ("flatrate", "free", "ads", "rent", "buy"):
         for p in region_data.get(key, []):
@@ -151,9 +159,52 @@ async def _ott_tmdb(hx: httpx.AsyncClient, mtype: str, tmdb_id: int,
                 providers.setdefault(key, [])
                 if name not in providers[key]:
                     providers[key].append(name)
-
     return {"title": title, "year": year, "providers": providers,
             "source": "TMDB", "jw_link": jw_link}
+
+
+# ── Poster session helpers ────────────────────────────────────────────────────
+
+def _classify_posters(images: dict) -> dict[str, list]:
+    """
+    Split TMDB images into three buckets matching the UI:
+      portrait        → aspect_ratio < 1   (tall movie posters)
+      landscape       → aspect_ratio >= 1 AND iso_639_1 set  (stylised backdrops)
+      clean_landscape → aspect_ratio >= 1 AND iso_639_1 is None/empty (logo-free)
+    """
+    portrait        = []
+    landscape       = []
+    clean_landscape = []
+
+    for p in images.get("posters", []):
+        if p.get("aspect_ratio", 1) < 1:
+            portrait.append(p)
+
+    for b in images.get("backdrops", []):
+        lang = b.get("iso_639_1") or ""
+        if lang:
+            landscape.append(b)
+        else:
+            clean_landscape.append(b)
+
+    return {
+        "portrait":        portrait,
+        "landscape":       landscape,
+        "clean_landscape": clean_landscape,
+    }
+
+
+def _type_label(key: str, count: int) -> str:
+    labels = {
+        "portrait":        "Portrait",
+        "landscape":       "Landscape",
+        "clean_landscape": "Clean Landscape",
+    }
+    return f"{labels[key]} ({count})"
+
+
+# Per-chat poster sessions
+_poster_sessions: dict[int, dict] = {}
 
 
 # ── Handler registration ──────────────────────────────────────────────────────
@@ -161,8 +212,7 @@ async def _ott_tmdb(hx: httpx.AsyncClient, mtype: str, tmdb_id: int,
 def register(app: Client):
 
     # ── /imdb ─────────────────────────────────────────────────────────────────
-
-    @app.on_message(filters.command("imdb"))
+    @app.on_message(filters.command("imdb") & filters.private)
     async def cmd_imdb(client: Client, message: Message):
         u = message.from_user
         await db.ensure_user(u.id, u.username, _full_name(u))
@@ -201,13 +251,11 @@ def register(app: Client):
         cast_str = ", ".join(c["name"] for c in cast) or "N/A"
         imdb_id  = detail.get("external_ids", {}).get("imdb_id", "")
         poster   = detail.get("poster_path", "")
-
-        # Star rating bar
-        stars = "⭐" * round(rating / 2)
+        stars    = "⭐" * round(rating / 2)
 
         text = (
             f"🎬 **{title}** ({year})\n"
-            f"{stars}\n"
+            f"{stars}\n\n"
             f"⭐ **Rating**   : `{rating:.1f}/10` ({votes:,} votes)\n"
             f"🎭 **Genre**    : `{genres}`\n"
             f"⏱ **Runtime**  : `{runtime} min`\n"
@@ -217,31 +265,26 @@ def register(app: Client):
             f"📖 **Overview:**\n{overview}"
         )
 
-        btns = []
+        btns_row1 = []
         if imdb_id:
-            btns.append(InlineKeyboardButton("🎬 IMDB",  url=f"https://www.imdb.com/title/{imdb_id}"))
-        btns.append(InlineKeyboardButton("🎞 TMDB", url=f"https://www.themoviedb.org/{mtype}/{detail['id']}"))
-        # Also add OTT button
+            btns_row1.append(InlineKeyboardButton("🎬 IMDB",  url=f"https://www.imdb.com/title/{imdb_id}"))
+        btns_row1.append(InlineKeyboardButton("🎞 TMDB", url=f"https://www.themoviedb.org/{mtype}/{detail['id']}"))
         btns_row2 = [InlineKeyboardButton(
             "📺 Check OTT",
             callback_data=f"check_ott|{mtype}|{detail['id']}|{title[:30]}|{year}",
         )]
-        keyboard = InlineKeyboardMarkup([btns, btns_row2])
+        keyboard = InlineKeyboardMarkup([btns_row1, btns_row2])
 
         await wait.delete()
         if poster:
             await message.reply_photo(
-                f"{TMDB_IMG}{poster}",
-                caption=text,
-                parse_mode=MD,
-                reply_markup=keyboard,
+                f"{TMDB_IMG}{poster}", caption=text, parse_mode=MD, reply_markup=keyboard,
             )
         else:
             await message.reply(text, parse_mode=MD, reply_markup=keyboard)
 
     # ── /ott ──────────────────────────────────────────────────────────────────
-
-    @app.on_message(filters.command("ott"))
+    @app.on_message(filters.command("ott") & filters.private)
     async def cmd_ott(client: Client, message: Message):
         u = message.from_user
         await db.ensure_user(u.id, u.username, _full_name(u))
@@ -277,12 +320,14 @@ def register(app: Client):
         await wait.delete()
         await _send_ott_result(message, result, query, poster, reply=True)
 
-    # Inline OTT check from /imdb card
     @app.on_callback_query(filters.regex(r"^check_ott\|"))
     async def ott_inline_cb(client: Client, query: CallbackQuery):
         await query.answer("🔍 Fetching OTT data…")
-        _, mtype, tmdb_id_str, title, year = query.data.split("|", 4)
-        tmdb_id = int(tmdb_id_str)
+        parts   = query.data.split("|", 4)
+        mtype   = parts[1]
+        tmdb_id = int(parts[2])
+        title   = parts[3]
+        year    = parts[4]
 
         async with httpx.AsyncClient(timeout=20) as hx:
             result = await _ott_justwatch(hx, title, year) if JUSTWATCH_API else None
@@ -291,7 +336,8 @@ def register(app: Client):
 
         await _send_ott_result(query.message, result, title, poster=None, reply=True)
 
-    async def _send_ott_result(target, result: dict, query: str, poster: str | None, reply: bool):
+    async def _send_ott_result(target, result: dict, query: str,
+                                poster: str | None, reply: bool):
         title_str = result["title"]
         year_str  = result["year"]
         providers = result["providers"]
@@ -308,9 +354,12 @@ def register(app: Client):
             lines.append("_Not available on any streaming platform in your region yet._")
         lines.append(f"\n_Source: {source}_")
 
-        jw_link  = result.get("jw_link") or f"https://www.justwatch.com/in/search?q={query.replace(' ', '+')}"
-        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("🔍 View on JustWatch", url=jw_link)]])
-        text     = "\n".join(lines)
+        jw_link  = result.get("jw_link") or \
+                   f"https://www.justwatch.com/in/search?q={query.replace(' ', '+')}"
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("🔍 View on JustWatch", url=jw_link)
+        ]])
+        text = "\n".join(lines)
 
         if poster and reply:
             await target.reply_photo(f"{TMDB_IMG}{poster}", caption=text,
@@ -320,11 +369,8 @@ def register(app: Client):
         else:
             await target.edit(text, parse_mode=MD, reply_markup=keyboard)
 
-    # ── /posters ──────────────────────────────────────────────────────────────
-
-    _poster_sessions: dict[int, dict] = {}
-
-    @app.on_message(filters.command("posters"))
+    # ── /posters — Step 1: search & type picker ───────────────────────────────
+    @app.on_message(filters.command("posters") & filters.private)
     async def cmd_posters(client: Client, message: Message):
         u = message.from_user
         await db.ensure_user(u.id, u.username, _full_name(u))
@@ -343,13 +389,13 @@ def register(app: Client):
             await message.reply(
                 "🖼 **Movie Posters**\n\n"
                 "**Usage:** `/posters <movie name>`\n"
-                "**Example:** `/posters RRR`",
+                "**Example:** `/posters Kadaisi Ulaga Por`",
                 parse_mode=MD,
             )
             return
 
         query = " ".join(args)
-        wait  = await message.reply(f"🔍 Fetching posters for **{query}**…", parse_mode=MD)
+        wait  = await message.reply(f"🔍 Searching for **{query}**…", parse_mode=MD)
 
         async with httpx.AsyncClient(timeout=15) as hx:
             hit = await _tmdb_search(query, hx)
@@ -359,83 +405,198 @@ def register(app: Client):
             detail = await _tmdb_detail(hit["media_type"], hit["id"], hx)
 
         images  = detail.get("images", {})
-        posters = images.get("posters", []) + images.get("backdrops", [])
-        if not posters:
+        buckets = _classify_posters(images)
+
+        # Check we have at least one image
+        total_imgs = sum(len(v) for v in buckets.values())
+        if total_imgs == 0:
             await wait.edit("❌ No posters found for this title.")
             return
 
-        title = detail.get("title") or detail.get("name", "")
-        year  = (detail.get("release_date") or detail.get("first_air_date", ""))[:4]
+        title   = detail.get("title") or detail.get("name", "")
+        year    = (detail.get("release_date") or detail.get("first_air_date", ""))[:4]
+        mtype   = hit["media_type"]
+        tmdb_id = detail["id"]
+        tmdb_url = f"https://www.themoviedb.org/{mtype}/{tmdb_id}"
 
+        # Store in session
         _poster_sessions[message.chat.id] = {
-            "posters": posters,
-            "index":   0,
-            "title":   f"{title} ({year})",
-            "tmdb_id": detail["id"],
-            "mtype":   hit["media_type"],
+            "buckets":  buckets,
+            "type":     None,      # selected bucket key
+            "index":    0,
+            "title":    f"{title} ({year})",
+            "mtype":    mtype,
+            "tmdb_id":  tmdb_id,
+            "tmdb_url": tmdb_url,
         }
 
         await wait.delete()
-        await _send_poster(client, message.chat.id, send_new=True, reply_to=message)
 
-    async def _send_poster(client: Client, chat_id: int,
-                            send_new: bool = False, reply_to=None, edit_msg=None):
-        s     = _poster_sessions.get(chat_id)
+        # Build type picker keyboard — only show non-empty types
+        rows = []
+        pair = []
+        for key in ("landscape", "portrait", "clean_landscape"):
+            count = len(buckets[key])
+            if count == 0:
+                continue
+            label = _type_label(key, count)
+            btn   = InlineKeyboardButton(label, callback_data=f"pt_type|{key}")
+            pair.append(btn)
+            if len(pair) == 2:
+                rows.append(pair)
+                pair = []
+        if pair:
+            rows.append(pair)
+        rows.append([
+            InlineKeyboardButton("🔙 Back",  callback_data="pt_close"),
+            InlineKeyboardButton("❌ Close", callback_data="pt_close"),
+        ])
+
+        await message.reply(
+            f"**{title} ({year})**\n\n"
+            f"TMDB : {tmdb_url}\n\n"
+            "**Select Poster Type :-**",
+            parse_mode=MD,
+            reply_markup=InlineKeyboardMarkup(rows),
+        )
+
+    # ── /posters — Step 2: type selected → show first poster ─────────────────
+    @app.on_callback_query(filters.regex(r"^pt_type\|"))
+    async def poster_type_cb(client: Client, query: CallbackQuery):
+        await query.answer()
+        cid     = query.message.chat.id
+        s       = _poster_sessions.get(cid)
         if not s:
+            await query.answer("Session expired. Use /posters again.", show_alert=True)
             return
+
+        chosen_type         = query.data.split("|", 1)[1]
+        s["type"]           = chosen_type
+        s["index"]          = 0
+        await _send_poster_view(client, query.message, cid, edit=True)
+
+    # ── /posters — Navigation callbacks ──────────────────────────────────────
+    @app.on_callback_query(filters.regex(r"^pt_(prev|next|first|last|back|close)$"))
+    async def poster_nav_cb(client: Client, query: CallbackQuery):
+        action = query.data.split("_", 1)[1]
+        cid    = query.message.chat.id
+        s      = _poster_sessions.get(cid)
+
+        await query.answer()
+
+        if action == "close":
+            await query.message.delete()
+            _poster_sessions.pop(cid, None)
+            return
+
+        if action == "back":
+            # Go back to type picker
+            if not s:
+                return
+            buckets  = s["buckets"]
+            rows     = []
+            pair     = []
+            for key in ("landscape", "portrait", "clean_landscape"):
+                count = len(buckets[key])
+                if count == 0:
+                    continue
+                label = _type_label(key, count)
+                btn   = InlineKeyboardButton(label, callback_data=f"pt_type|{key}")
+                pair.append(btn)
+                if len(pair) == 2:
+                    rows.append(pair)
+                    pair = []
+            if pair:
+                rows.append(pair)
+            rows.append([
+                InlineKeyboardButton("🔙 Back",  callback_data="pt_close"),
+                InlineKeyboardButton("❌ Close", callback_data="pt_close"),
+            ])
+            try:
+                await query.message.edit(
+                    f"**{s['title']}**\n\n"
+                    f"TMDB : {s['tmdb_url']}\n\n"
+                    "**Select Poster Type :-**",
+                    parse_mode=MD,
+                    reply_markup=InlineKeyboardMarkup(rows),
+                )
+            except Exception:
+                pass
+            return
+
+        if not s or not s.get("type"):
+            return
+
+        items = s["buckets"].get(s["type"], [])
+        total = len(items)
         idx   = s["index"]
-        p     = s["posters"][idx]
-        total = len(s["posters"])
-        ptype = "Portrait" if p.get("aspect_ratio", 1) < 1 else "Landscape"
+
+        if   action == "next":  s["index"] = (idx + 1) % total
+        elif action == "prev":  s["index"] = (idx - 1) % total
+        elif action == "first": s["index"] = 0
+        elif action == "last":  s["index"] = total - 1
+
+        await _send_poster_view(client, query.message, cid, edit=True)
+
+    async def _send_poster_view(client: Client, msg, cid: int, edit: bool = False):
+        s     = _poster_sessions.get(cid)
+        if not s or not s.get("type"):
+            return
+
+        items = s["buckets"].get(s["type"], [])
+        idx   = s["index"]
+        total = len(items)
+        p     = items[idx]
+
+        # Poster metadata
+        ar    = p.get("aspect_ratio", 1)
+        ptype = {
+            "portrait":        "Portrait",
+            "landscape":       "Landscape",
+            "clean_landscape": "Clean Landscape",
+        }.get(s["type"], "Unknown")
         lang  = (p.get("iso_639_1") or "N/A").upper()
         w, h  = p.get("width", 0), p.get("height", 0)
         url   = f"https://image.tmdb.org/t/p/original{p['file_path']}"
 
         caption = (
-            f"🖼 **{s['title']}**\n\n"
-            f"🎞 TMDB : [View Page](https://www.themoviedb.org/{s['mtype']}/{s['tmdb_id']})\n"
-            f"📐 Type : `{ptype}` ({w}×{h})\n"
-            f"🌐 Lang : `{lang}`\n"
-            f"🔗 [Full Resolution]({url})"
+            f"**{s['title']}**\n\n"
+            f"• TMDB : {s['tmdb_url']}\n"
+            f"• Type : {ptype}\n"
+            f"• Language: {lang}\n"
+            f"• Width: {w}, Height: {h}\n"
+            f"• [Click Here]({url})"
         )
+
+        # Navigation: <<  <  idx/total  >  >>
         nav = [
-            InlineKeyboardButton("⏮", callback_data="poster_first"),
-            InlineKeyboardButton("◀",  callback_data="poster_prev"),
-            InlineKeyboardButton(f"{idx+1}/{total}", callback_data="poster_noop"),
-            InlineKeyboardButton("▶",  callback_data="poster_next"),
-            InlineKeyboardButton("⏭", callback_data="poster_last"),
+            InlineKeyboardButton("<<",  callback_data="pt_first"),
+            InlineKeyboardButton("<",   callback_data="pt_prev"),
+            InlineKeyboardButton(f"{idx+1}/{total}", callback_data="pt_noop"),
+            InlineKeyboardButton(">",   callback_data="pt_next"),
+            InlineKeyboardButton(">>",  callback_data="pt_last"),
         ]
-        ctrl    = [InlineKeyboardButton("❌ Close", callback_data="poster_close")]
+        ctrl = [
+            InlineKeyboardButton("🔙 Back",  callback_data="pt_back"),
+            InlineKeyboardButton("❌ Close", callback_data="pt_close"),
+        ]
         keyboard = InlineKeyboardMarkup([nav, ctrl])
 
-        if edit_msg:
-            await edit_msg.delete()
-        if send_new and reply_to:
-            await reply_to.reply_photo(url, caption=caption,
-                                        parse_mode=MD, reply_markup=keyboard)
+        if edit:
+            # Delete old message and send new photo (edit_media on photo is cleaner)
+            try:
+                await msg.delete()
+            except Exception:
+                pass
+            await client.send_photo(
+                cid, url, caption=caption, parse_mode=MD, reply_markup=keyboard,
+            )
         else:
-            await client.send_photo(chat_id, url, caption=caption,
-                                    parse_mode=MD, reply_markup=keyboard)
+            await client.send_photo(
+                cid, url, caption=caption, parse_mode=MD, reply_markup=keyboard,
+            )
 
-    @app.on_callback_query(filters.regex(r"^poster_"))
-    async def poster_cb(client: Client, query: CallbackQuery):
-        action = query.data
-        cid    = query.message.chat.id
-        s      = _poster_sessions.get(cid)
+    # Handle the noop button (counter display)
+    @app.on_callback_query(filters.regex(r"^pt_noop$"))
+    async def poster_noop_cb(client: Client, query: CallbackQuery):
         await query.answer()
-
-        if action == "poster_close":
-            await query.message.delete()
-            return
-        if not s:
-            await query.answer("Session expired. Use /posters again.", show_alert=True)
-            return
-
-        total = len(s["posters"])
-        if   action == "poster_next":  s["index"] = (s["index"] + 1) % total
-        elif action == "poster_prev":  s["index"] = (s["index"] - 1) % total
-        elif action == "poster_first": s["index"] = 0
-        elif action == "poster_last":  s["index"] = total - 1
-        elif action == "poster_noop":  return
-
-        await _send_poster(client, cid, edit_msg=query.message)

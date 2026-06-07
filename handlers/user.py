@@ -18,38 +18,36 @@ from config import (
     FREE_MEDIA_LIMIT, FREE_POSTER_LIMIT,
 )
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+MD = ParseMode.MARKDOWN
 
+# ── State ─────────────────────────────────────────────────────────────────────
+# Users who have clicked "Verify Payment" and are expected to send their UTR next
 _awaiting_utr: set[int] = set()
 
 
-def _full_name(user) -> str:
-    """Safely build full name from Pyrogram User object."""
-    parts = [user.first_name or "", user.last_name or ""]
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _full_name(u) -> str:
+    parts = [u.first_name or "", u.last_name or ""]
     return " ".join(p for p in parts if p).strip() or "Unknown"
 
 
-def md(text: str) -> dict:
-    """Shorthand kwargs for Markdown parse mode."""
-    return {"parse_mode": ParseMode.MARKDOWN}
-
-
-# ── Texts ─────────────────────────────────────────────────────────────────────
+# ── Static texts ──────────────────────────────────────────────────────────────
 
 HELP_TEXT = (
     "📖 **Command Reference**\n\n"
     "━━━━━━━━━━━━━━━━━━\n"
     "🎬 **Movie & OTT**\n\n"
-    "`/imdb` `<title>` — Detailed info from TMDB/IMDB\n"
-    "`/ott` `<title>` — Check streaming availability\n"
-    "`/posters` `<title>` — Browse movie posters\n\n"
+    "`/imdb <title>` — Detailed info from TMDB/IMDB\n"
+    "`/ott <title>` — Check streaming availability\n"
+    "`/posters <title>` — Browse movie posters\n\n"
     "━━━━━━━━━━━━━━━━━━\n"
     "🎞 **Video Tools**\n\n"
     "`/mediainfo` — Codec, resolution, bitrate _(reply to video)_\n"
     "`/sample` — 30-second preview clip _(reply to video)_\n"
     "`/screenshot` — 10 screenshots _(reply to video)_\n"
-    "`/yt` `<url>` — YouTube quality picker + direct link\n"
-    "`/song` `<name>` — Search YouTube Music, get MP3\n"
+    "`/yt <url>` — YouTube quality picker + direct link\n"
+    "`/song <name>` — Search YouTube Music, get MP3\n"
     "`/link` — Watch Online + Download link _(reply to file)_\n\n"
     "━━━━━━━━━━━━━━━━━━\n"
     "📊 **Account**\n\n"
@@ -60,58 +58,50 @@ HELP_TEXT = (
     "_For issues, contact the bot admin._"
 )
 
-START_TEXT = (
-    "👋 Hello, **{name}**!\n\n"
-    "Welcome to **@{bot}** — your all-in-one Telegram utility bot.\n\n"
-    "━━━━━━━━━━━━━━━━━━\n"
-    "📽 **Movie & OTT**\n"
-    "`/imdb` — Movie/Series info\n"
-    "`/ott` — OTT availability\n"
-    "`/posters` — Movie posters\n\n"
-    "🎞 **Video Tools**\n"
-    "`/mediainfo` — Technical media info\n"
-    "`/sample` — Generate 30s sample clip\n"
-    "`/screenshot` — Take 10 screenshots\n"
-    "`/link` — Generate Watch + Download link\n"
-    "`/yt` — YouTube download link\n"
-    "`/song` — Search & download song as MP3\n\n"
-    "📊 **Account**\n"
-    "`/usage` — Your usage stats\n"
-    "`/premium` — Upgrade to Premium\n"
-    "`/help` — Full command list\n"
-    "━━━━━━━━━━━━━━━━━━"
-)
-
 
 def register(app: Client):
 
     # ── /start ────────────────────────────────────────────────────────────────
-
     @app.on_message(filters.command("start") & filters.private)
     async def cmd_start(client: Client, message: Message):
         u = message.from_user
         await db.ensure_user(u.id, u.username, _full_name(u))
 
+        text = (
+            f"👋 Hello, **{u.first_name}**!\n\n"
+            f"Welcome to **@{BOT_USERNAME}** — your all-in-one Telegram utility bot.\n\n"
+            "━━━━━━━━━━━━━━━━━━\n"
+            "📽 **Movie & OTT**\n"
+            "`/imdb` — Movie/Series info\n"
+            "`/ott` — OTT availability\n"
+            "`/posters` — Movie posters\n\n"
+            "🎞 **Video Tools**\n"
+            "`/mediainfo` — Technical media info\n"
+            "`/sample` — 30s sample clip\n"
+            "`/screenshot` — 10 screenshots\n"
+            "`/link` — Watch + Download link\n"
+            "`/yt` — YouTube download\n"
+            "`/song` — Search & download MP3\n\n"
+            "📊 **Account**\n"
+            "`/usage` — Your usage stats\n"
+            "`/premium` — Upgrade to Premium\n"
+            "`/help` — Full command list\n"
+            "━━━━━━━━━━━━━━━━━━"
+        )
         keyboard = InlineKeyboardMarkup([
             [
                 InlineKeyboardButton("⭐ Get Premium", callback_data="premium_info"),
                 InlineKeyboardButton("❓ Help",        callback_data="show_help"),
             ]
         ])
-        await message.reply(
-            START_TEXT.format(name=u.first_name, bot=BOT_USERNAME),
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=keyboard,
-        )
+        await message.reply(text, parse_mode=MD, reply_markup=keyboard)
 
     # ── /help ─────────────────────────────────────────────────────────────────
-
-    @app.on_message(filters.command("help"))
+    @app.on_message(filters.command("help") & filters.private)
     async def cmd_help(client: Client, message: Message):
-        await message.reply(HELP_TEXT, parse_mode=ParseMode.MARKDOWN)
+        await message.reply(HELP_TEXT, parse_mode=MD)
 
     # ── /usage ────────────────────────────────────────────────────────────────
-
     @app.on_message(filters.command("usage") & filters.private)
     async def cmd_usage(client: Client, message: Message):
         u = message.from_user
@@ -123,20 +113,20 @@ def register(app: Client):
             return
 
         is_prem = bool(row["is_premium"]) and row["premium_expiry"] > time.time()
-        status  = "⭐ Premium User" if is_prem else "👤 Free User"
 
         if is_prem:
             exp        = time.strftime("%d %b %Y", time.localtime(row["premium_expiry"]))
-            status    += f" (expires {exp})"
+            status     = f"⭐ Premium User _(expires {exp})_"
             media_str  = f"{row['media_usage']} / ∞"
             poster_str = f"{row['poster_usage']} / ∞"
         else:
+            status     = "👤 Free User"
             media_str  = f"{row['media_usage']}/{FREE_MEDIA_LIMIT}"
             poster_str = f"{row['poster_usage']}/{FREE_POSTER_LIMIT}"
 
         text = (
             f"📊 **Your Usage** (`#{u.id}`)\n\n"
-            f"Status  : `{status}`\n\n"
+            f"Status   : {status}\n\n"
             f"🎞 Video Tools   : `{media_str}`\n"
             f"🖼 Poster Search : `{poster_str}`\n\n"
             "_Limits reset every 30 days._"
@@ -146,20 +136,18 @@ def register(app: Client):
             keyboard = InlineKeyboardMarkup([[
                 InlineKeyboardButton("⭐ Upgrade to Premium", callback_data="premium_info")
             ]])
-            await message.reply(text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
+            await message.reply(text, parse_mode=MD, reply_markup=keyboard)
         else:
-            await message.reply(text, parse_mode=ParseMode.MARKDOWN)
+            await message.reply(text, parse_mode=MD)
 
     # ── /premium ──────────────────────────────────────────────────────────────
-
     @app.on_message(filters.command("premium") & filters.private)
     async def cmd_premium(client: Client, message: Message):
         u = message.from_user
         await db.ensure_user(u.id, u.username, _full_name(u))
         await _send_premium_info(message)
 
-    # ── Callbacks ─────────────────────────────────────────────────────────────
-
+    # ── Callback queries ───────────────────────────────────────────────────────
     @app.on_callback_query(filters.regex(r"^(premium_info|premium_verify|premium_cancel|show_help)$"))
     async def on_premium_cb(client: Client, query: CallbackQuery):
         action = query.data
@@ -173,24 +161,35 @@ def register(app: Client):
             await query.message.edit(
                 "📤 Please send your **UTR / Transaction ID** now.\n\n"
                 "_Your payment will be verified and Premium activated within a few minutes._",
-                parse_mode=ParseMode.MARKDOWN,
+                parse_mode=MD,
             )
 
         elif action == "premium_cancel":
             await query.message.delete()
 
         elif action == "show_help":
-            await query.message.edit(HELP_TEXT, parse_mode=ParseMode.MARKDOWN)
+            await query.message.edit(HELP_TEXT, parse_mode=MD)
 
-    # ── UTR capture (plain text in private) ───────────────────────────────────
+    # ── UTR capture ───────────────────────────────────────────────────────────
+    # CRITICAL: Use a custom filter function — NOT ~filters.command("")
+    # which is broken in Pyrogram. We check explicitly that the message
+    # does NOT start with "/" so commands are never intercepted here.
+    def _is_utr_message(_, __, message: Message) -> bool:
+        if not message.text:
+            return False
+        if message.text.startswith("/"):   # never intercept commands
+            return False
+        if message.from_user is None:
+            return False
+        return message.from_user.id in _awaiting_utr
 
-    @app.on_message(filters.text & filters.private & ~filters.command(""))
+    utr_filter = filters.create(_is_utr_message)
+
+    @app.on_message(filters.private & filters.text & utr_filter)
     async def handle_utr(client: Client, message: Message):
         uid = message.from_user.id
-        if uid not in _awaiting_utr:
-            return
-
         utr = message.text.strip()
+
         if len(utr) < 6:
             await message.reply("❌ That doesn't look like a valid UTR. Please try again.")
             return
@@ -202,7 +201,7 @@ def register(app: Client):
             f"✅ UTR `{utr}` received!\n\n"
             "Your payment is being verified. "
             "Premium will be activated within a few minutes.",
-            parse_mode=ParseMode.MARKDOWN,
+            parse_mode=MD,
         )
 
 
@@ -218,8 +217,7 @@ async def _send_premium_info(target, edit: bool = False):
         "💳 **How To Buy:**\n"
         f"1. Send ₹{PREMIUM_PRICE} to UPI: `{UPI_ID}`\n"
         "2. Wait 30 seconds\n"
-        "3. Click **Verify** below\n"
-        "4. Send your UTR/Transaction ID\n\n"
+        "3. Click **Verify** below and send your UTR/Transaction ID\n\n"
         "_For queries, contact the admin._"
     )
     keyboard = InlineKeyboardMarkup([
@@ -227,6 +225,6 @@ async def _send_premium_info(target, edit: bool = False):
         [InlineKeyboardButton("❌ Cancel",         callback_data="premium_cancel")],
     ])
     if edit:
-        await target.edit(text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
+        await target.edit(text, parse_mode=MD, reply_markup=keyboard)
     else:
-        await target.reply(text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
+        await target.reply(text, parse_mode=MD, reply_markup=keyboard)

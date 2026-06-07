@@ -224,7 +224,7 @@ def register(app: Client):
 
     # ── /mediainfo ────────────────────────────────────────────────────────────
 
-    @app.on_message(filters.command("mediainfo"))
+    @app.on_message(filters.command("mediainfo") & filters.private)
     async def cmd_mediainfo(client: Client, message: Message):
         u = message.from_user
         await db.ensure_user(u.id, u.username, _full_name(u))
@@ -297,7 +297,7 @@ def register(app: Client):
 
     # ── /sample ───────────────────────────────────────────────────────────────
 
-    @app.on_message(filters.command("sample"))
+    @app.on_message(filters.command("sample") & filters.private)
     async def cmd_sample(client: Client, message: Message):
         u = message.from_user
         await db.ensure_user(u.id, u.username, _full_name(u))
@@ -389,7 +389,7 @@ def register(app: Client):
 
     # ── /screenshot ───────────────────────────────────────────────────────────
 
-    @app.on_message(filters.command("screenshot"))
+    @app.on_message(filters.command("screenshot") & filters.private)
     async def cmd_screenshot(client: Client, message: Message):
         u = message.from_user
         await db.ensure_user(u.id, u.username, _full_name(u))

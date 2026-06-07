@@ -97,7 +97,7 @@ async def _cobalt_link(url: str, quality: str) -> str | None:
 
 def register(app: Client):
 
-    @app.on_message(filters.command("yt"))
+    @app.on_message(filters.command("yt") & filters.private)
     async def cmd_yt(client: Client, message: Message):
         u = message.from_user
         await db.ensure_user(u.id, u.username, _full_name(u))

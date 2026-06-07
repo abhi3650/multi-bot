@@ -35,7 +35,7 @@ def _human_size(n: int) -> str:
 
 def register(app: Client):
 
-    @app.on_message(filters.command("link"))
+    @app.on_message(filters.command("link") & filters.private)
     async def cmd_link(client: Client, message: Message):
         u = message.from_user
         await db.ensure_user(u.id, u.username, _full_name(u))
