@@ -1,20 +1,26 @@
 """
 handlers/movie.py  —  /imdb  /ott  /posters
 
-/posters UI (matches the screenshots exactly):
-  Step 1 — Show movie title + "Select Poster Type" buttons:
-              [Landscape (N)]  [Portrait (N)]
-              [Clean Landscape (N)]
-              [Back]  [Close]
-  Step 2 — Browse within that type:
-              [<<]  [<]  [1/N]  [>]  [>>]
-              [Back]  [Close]
+/ott UI (matches screenshots exactly):
+  Step 1 — "Search Results For <query>":
+              [Meesaya Murukku (2017)]
+              [Close]
+  Step 2 — Show availability:
+              ≡ Title (Year)
+              🔥 Availability :-
+              • Platform1 •
+              CC ~ @BotName
+              [JustWatch preview card]
 
-OTT source priority:
-  1. JustWatch GraphQL  (if JUSTWATCH_API env is set)
-  2. TMDB Watch Providers  (always available)
+  JustWatch only — no TMDB fallback (removed as requested).
+  If JUSTWATCH_API is not set, shows a config message.
+
+/posters UI (matches screenshots):
+  Step 1 — Type picker: [Landscape (N)] [Portrait (N)] [Clean Landscape (N)]
+  Step 2 — Paginated: [<<] [<] [1/N] [>] [>>] + [Back] [Close]
 """
 
+import hashlib
 import logging
 
 import httpx
@@ -26,7 +32,7 @@ from pyrogram.types import (
 )
 
 import database as db
-from config import TMDB_API_KEY, TMDB_BASE, TMDB_IMG, JUSTWATCH_API
+from config import TMDB_API_KEY, TMDB_BASE, TMDB_IMG, JUSTWATCH_API, BOT_USERNAME
 
 MD  = ParseMode.MARKDOWN
 log = logging.getLogger(__name__)
@@ -39,13 +45,23 @@ def _full_name(u) -> str:
     return " ".join(p for p in parts if p).strip() or "Unknown"
 
 
-async def _tmdb_search(query: str, hx: httpx.AsyncClient) -> dict | None:
+def _sk(seed: str) -> str:
+    return hashlib.md5(seed.encode()).hexdigest()[:10]
+
+
+async def _tmdb_search_multi(query: str, hx: httpx.AsyncClient) -> list[dict]:
+    """Return up to 5 movie/tv results from TMDB."""
     r = await hx.get(
         f"{TMDB_BASE}/search/multi",
         params={"api_key": TMDB_API_KEY, "query": query, "include_adult": "false"},
     )
     results = r.json().get("results", [])
-    return next((x for x in results if x.get("media_type") in ("movie", "tv")), None)
+    return [x for x in results if x.get("media_type") in ("movie", "tv")][:5]
+
+
+async def _tmdb_search(query: str, hx: httpx.AsyncClient) -> dict | None:
+    results = await _tmdb_search_multi(query, hx)
+    return results[0] if results else None
 
 
 async def _tmdb_detail(mtype: str, tmdb_id: int, hx: httpx.AsyncClient) -> dict:
@@ -57,15 +73,7 @@ async def _tmdb_detail(mtype: str, tmdb_id: int, hx: httpx.AsyncClient) -> dict:
     return r.json()
 
 
-# ── OTT helpers ───────────────────────────────────────────────────────────────
-
-_OTT_LABELS = {
-    "FLATRATE": ("✅", "Subscription"), "flatrate": ("✅", "Subscription"),
-    "FREE":     ("🆓", "Free"),         "free":     ("🆓", "Free"),
-    "ADS":      ("📢", "With Ads"),     "ads":      ("📢", "With Ads"),
-    "BUY":      ("🛒", "Buy"),          "buy":      ("🛒", "Buy"),
-    "RENT":     ("💰", "Rent"),         "rent":     ("💰", "Rent"),
-}
+# ── JustWatch (only OTT source) ───────────────────────────────────────────────
 
 _JW_GQL = "https://apis.justwatch.com/graphql"
 _JW_Q   = """
@@ -74,17 +82,19 @@ query GetStreamingOffers($searchQuery: String!, $country: Country!, $language: L
     searchTitlesFilter: { searchQuery: $searchQuery }
     country: $country
     language: $language
-    first: 5
+    first: 8
   ) {
     edges {
       node {
         content(country: $country, language: $language) {
           title
           originalReleaseYear
+          posterUrl(profile: S276)
+          externalIds { imdbId }
         }
         offers(country: $country, platform: WEB) {
           monetizationType
-          provider { clearName }
+          provider { clearName technicalName }
         }
       }
     }
@@ -92,10 +102,22 @@ query GetStreamingOffers($searchQuery: String!, $country: Country!, $language: L
 }
 """
 
+_OTT_LABELS = {
+    "FLATRATE": "Subscription",
+    "FREE":     "Free",
+    "ADS":      "With Ads",
+    "BUY":      "Buy",
+    "RENT":     "Rent",
+}
 
-async def _ott_justwatch(hx: httpx.AsyncClient, title: str, year: str) -> dict | None:
+# OTT search sessions: { session_key: [node, ...] }
+_ott_sessions: dict[str, list] = {}
+
+
+async def _jw_search(hx: httpx.AsyncClient, title: str) -> list:
+    """Query JustWatch GraphQL. Returns list of nodes."""
     if not JUSTWATCH_API:
-        return None
+        return []
     try:
         resp = await hx.post(
             _JW_GQL,
@@ -109,101 +131,51 @@ async def _ott_justwatch(hx: httpx.AsyncClient, title: str, year: str) -> dict |
                 "x-api-key":       JUSTWATCH_API,
                 "Origin":          "https://www.justwatch.com",
             },
-            timeout=12,
+            timeout=15,
         )
         if resp.status_code != 200:
-            log.warning("[ott/jw] HTTP %s — falling back to TMDB", resp.status_code)
-            return None
-        edges = resp.json().get("data", {}).get("searchTitles", {}).get("edges", [])
-        if not edges:
-            return None
-        chosen = next(
-            (e["node"] for e in edges
-             if title.lower() in (e["node"].get("content") or {}).get("title", "").lower()),
-            edges[0]["node"],
+            log.warning("[jw] HTTP %s for %r", resp.status_code, title)
+            return []
+        return (
+            resp.json()
+            .get("data", {})
+            .get("searchTitles", {})
+            .get("edges", [])
         )
-        providers: dict[str, list] = {}
-        for offer in chosen.get("offers") or []:
-            mtype = offer.get("monetizationType", "UNKNOWN")
-            name  = (offer.get("provider") or {}).get("clearName")
-            if name:
-                providers.setdefault(mtype, [])
-                if name not in providers[mtype]:
-                    providers[mtype].append(name)
-        content = chosen.get("content") or {}
-        return {
-            "title":     content.get("title", title),
-            "year":      str(content.get("originalReleaseYear", year or "")),
-            "providers": providers,
-            "source":    "JustWatch",
-        }
     except Exception as exc:
-        log.warning("[ott/jw] %s — falling back to TMDB", exc)
-        return None
+        log.warning("[jw] %s", exc)
+        return []
 
 
-async def _ott_tmdb(hx: httpx.AsyncClient, mtype: str, tmdb_id: int,
-                    title: str, year: str) -> dict:
-    r = await hx.get(
-        f"{TMDB_BASE}/{mtype}/{tmdb_id}/watch/providers",
-        params={"api_key": TMDB_API_KEY},
-    )
-    prov_data   = r.json().get("results", {})
-    region_data = prov_data.get("IN") or prov_data.get("US") or {}
-    jw_link     = region_data.get("link", "")
+def _providers_from_node(node: dict) -> dict[str, list]:
     providers: dict[str, list] = {}
-    for key in ("flatrate", "free", "ads", "rent", "buy"):
-        for p in region_data.get(key, []):
-            name = p.get("provider_name", "")
-            if name:
-                providers.setdefault(key, [])
-                if name not in providers[key]:
-                    providers[key].append(name)
-    return {"title": title, "year": year, "providers": providers,
-            "source": "TMDB", "jw_link": jw_link}
+    for offer in node.get("offers") or []:
+        mtype = offer.get("monetizationType", "UNKNOWN")
+        name  = (offer.get("provider") or {}).get("clearName")
+        if name and mtype in _OTT_LABELS:
+            providers.setdefault(mtype, [])
+            if name not in providers[mtype]:
+                providers[mtype].append(name)
+    return providers
 
 
-# ── Poster session helpers ────────────────────────────────────────────────────
+# ── Poster helpers ────────────────────────────────────────────────────────────
 
 def _classify_posters(images: dict) -> dict[str, list]:
-    """
-    Split TMDB images into three buckets matching the UI:
-      portrait        → aspect_ratio < 1   (tall movie posters)
-      landscape       → aspect_ratio >= 1 AND iso_639_1 set  (stylised backdrops)
-      clean_landscape → aspect_ratio >= 1 AND iso_639_1 is None/empty (logo-free)
-    """
-    portrait        = []
-    landscape       = []
-    clean_landscape = []
-
+    portrait, landscape, clean_landscape = [], [], []
     for p in images.get("posters", []):
         if p.get("aspect_ratio", 1) < 1:
             portrait.append(p)
-
     for b in images.get("backdrops", []):
         lang = b.get("iso_639_1") or ""
         if lang:
             landscape.append(b)
         else:
             clean_landscape.append(b)
-
-    return {
-        "portrait":        portrait,
-        "landscape":       landscape,
-        "clean_landscape": clean_landscape,
-    }
+    return {"portrait": portrait, "landscape": landscape,
+            "clean_landscape": clean_landscape}
 
 
-def _type_label(key: str, count: int) -> str:
-    labels = {
-        "portrait":        "Portrait",
-        "landscape":       "Landscape",
-        "clean_landscape": "Clean Landscape",
-    }
-    return f"{labels[key]} ({count})"
-
-
-# Per-chat poster sessions
 _poster_sessions: dict[int, dict] = {}
 
 
@@ -267,11 +239,15 @@ def register(app: Client):
 
         btns_row1 = []
         if imdb_id:
-            btns_row1.append(InlineKeyboardButton("🎬 IMDB",  url=f"https://www.imdb.com/title/{imdb_id}"))
-        btns_row1.append(InlineKeyboardButton("🎞 TMDB", url=f"https://www.themoviedb.org/{mtype}/{detail['id']}"))
+            btns_row1.append(
+                InlineKeyboardButton("🎬 IMDB",
+                                     url=f"https://www.imdb.com/title/{imdb_id}"))
+        btns_row1.append(
+            InlineKeyboardButton("🎞 TMDB",
+                                 url=f"https://www.themoviedb.org/{mtype}/{detail['id']}"))
         btns_row2 = [InlineKeyboardButton(
             "📺 Check OTT",
-            callback_data=f"check_ott|{mtype}|{detail['id']}|{title[:30]}|{year}",
+            callback_data=f"imdb_ott|{title[:40]}",
         )]
         keyboard = InlineKeyboardMarkup([btns_row1, btns_row2])
 
@@ -283,6 +259,13 @@ def register(app: Client):
         else:
             await message.reply(text, parse_mode=MD, reply_markup=keyboard)
 
+    # Inline "Check OTT" from /imdb card
+    @app.on_callback_query(filters.regex(r"^imdb_ott\|"))
+    async def imdb_ott_cb(client: Client, query: CallbackQuery):
+        await query.answer("🔍 Searching JustWatch…")
+        title = query.data.split("|", 1)[1]
+        await _ott_search_flow(client, query.message, title, from_callback=True)
+
     # ── /ott ──────────────────────────────────────────────────────────────────
     @app.on_message(filters.command("ott") & filters.private)
     async def cmd_ott(client: Client, message: Message):
@@ -292,82 +275,144 @@ def register(app: Client):
         args = message.command[1:]
         if not args:
             await message.reply(
-                "📺 **OTT Availability**\n\n"
+                "Give A Valid Movie/Series Name Along With Command!\n\n"
                 "**Usage:** `/ott <movie or series name>`\n"
-                "**Example:** `/ott Pushpa 2`",
+                "**Example:** `/ott Meesaya Murukku`",
                 parse_mode=MD,
             )
             return
 
         query = " ".join(args)
-        wait  = await message.reply(f"🔍 Checking OTT for **{query}**…", parse_mode=MD)
+        await _ott_search_flow(client, message, query, from_callback=False)
+
+    async def _ott_search_flow(client: Client, target: Message, query: str,
+                                from_callback: bool):
+        """
+        Step 1: search JustWatch, show results as buttons.
+        If only one result → skip to step 2 directly.
+        """
+        if not JUSTWATCH_API:
+            text = (
+                "⚠️ **JustWatch API not configured.**\n\n"
+                "Add your JustWatch API key to `.env`:\n"
+                "`JUSTWATCH_API=your_key_here`\n\n"
+                "_Get a key from https://rapidapi.com/search/justwatch_"
+            )
+            if from_callback:
+                await target.reply(text, parse_mode=MD)
+            else:
+                await target.reply(text, parse_mode=MD)
+            return
+
+        wait = await target.reply(f"🔍 Searching **{query}**…", parse_mode=MD)
 
         async with httpx.AsyncClient(timeout=20) as hx:
-            hit = await _tmdb_search(query, hx)
-            if not hit:
-                await wait.edit(f"❌ Could not find **{query}** on TMDB.", parse_mode=MD)
-                return
-            mtype       = hit["media_type"]
-            tmdb_id     = hit["id"]
-            clean_title = hit.get("title") or hit.get("name") or query
-            year        = (hit.get("release_date") or hit.get("first_air_date") or "")[:4]
-            poster      = hit.get("poster_path", "")
+            edges = await _jw_search(hx, query)
 
-            result = await _ott_justwatch(hx, clean_title, year) if JUSTWATCH_API else None
-            if result is None:
-                result = await _ott_tmdb(hx, mtype, tmdb_id, clean_title, year)
+        if not edges:
+            await wait.edit(
+                f"❌ No results found for **{query}** on JustWatch.",
+                parse_mode=MD,
+            )
+            return
 
-        await wait.delete()
-        await _send_ott_result(message, result, query, poster, reply=True)
+        nodes = [e["node"] for e in edges if e.get("node")]
 
-    @app.on_callback_query(filters.regex(r"^check_ott\|"))
-    async def ott_inline_cb(client: Client, query: CallbackQuery):
-        await query.answer("🔍 Fetching OTT data…")
-        parts   = query.data.split("|", 4)
-        mtype   = parts[1]
-        tmdb_id = int(parts[2])
-        title   = parts[3]
-        year    = parts[4]
+        if len(nodes) == 1:
+            # Only one result — go directly to detail
+            await wait.delete()
+            await _send_ott_detail(target, nodes[0], query)
+            return
 
-        async with httpx.AsyncClient(timeout=20) as hx:
-            result = await _ott_justwatch(hx, title, year) if JUSTWATCH_API else None
-            if result is None:
-                result = await _ott_tmdb(hx, mtype, tmdb_id, title, year)
+        # Multiple results — show picker
+        sk = _sk(query)
+        _ott_sessions[sk] = nodes
 
-        await _send_ott_result(query.message, result, title, poster=None, reply=True)
+        buttons = []
+        for i, node in enumerate(nodes):
+            content = node.get("content") or {}
+            title   = content.get("title", "Unknown")
+            year    = content.get("originalReleaseYear", "")
+            label   = f"{title} ({year})" if year else title
+            buttons.append([InlineKeyboardButton(
+                label, callback_data=f"ott_pick|{sk}|{i}"
+            )])
+        buttons.append([InlineKeyboardButton("❌ Close", callback_data="ott_close")])
 
-    async def _send_ott_result(target, result: dict, query: str,
-                                poster: str | None, reply: bool):
-        title_str = result["title"]
-        year_str  = result["year"]
-        providers = result["providers"]
-        source    = result["source"]
+        await wait.edit(
+            f"**Search Results For** {query}",
+            parse_mode=MD,
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
 
-        lines = [f"📺 **{title_str}** ({year_str})\n\n🔥 **Streaming Availability:**\n"]
-        found = False
-        for key, (emoji, label) in _OTT_LABELS.items():
-            names = providers.get(key, [])
-            if names:
-                lines.append(f"{emoji} **{label}:** {', '.join(names)}")
-                found = True
-        if not found:
-            lines.append("_Not available on any streaming platform in your region yet._")
-        lines.append(f"\n_Source: {source}_")
+    # Callback: user picks a result from search list
+    @app.on_callback_query(filters.regex(r"^ott_pick\|"))
+    async def ott_pick_cb(client: Client, query: CallbackQuery):
+        await query.answer()
+        _, sk, idx_str = query.data.split("|", 2)
+        nodes = _ott_sessions.get(sk)
+        if not nodes:
+            await query.answer("Session expired. Search again.", show_alert=True)
+            return
 
-        jw_link  = result.get("jw_link") or \
-                   f"https://www.justwatch.com/in/search?q={query.replace(' ', '+')}"
-        keyboard = InlineKeyboardMarkup([[
-            InlineKeyboardButton("🔍 View on JustWatch", url=jw_link)
-        ]])
-        text = "\n".join(lines)
+        idx  = int(idx_str)
+        node = nodes[idx]
 
-        if poster and reply:
-            await target.reply_photo(f"{TMDB_IMG}{poster}", caption=text,
-                                     parse_mode=MD, reply_markup=keyboard)
-        elif reply:
-            await target.reply(text, parse_mode=MD, reply_markup=keyboard)
+        await query.message.delete()
+
+        content = node.get("content") or {}
+        title   = content.get("title", "Unknown")
+        await _send_ott_detail(query.message, node, title)
+
+    @app.on_callback_query(filters.regex(r"^ott_close$"))
+    async def ott_close_cb(client: Client, query: CallbackQuery):
+        await query.answer()
+        await query.message.delete()
+
+    async def _send_ott_detail(target: Message, node: dict, query: str):
+        """
+        Step 2 — Show availability matching the screenshot:
+          ≡ Title (Year)
+          🔥 Availability :-
+          • Platform1 •
+          CC ~ @BotName
+        """
+        content   = node.get("content") or {}
+        title     = content.get("title", query)
+        year      = content.get("originalReleaseYear", "")
+        providers = _providers_from_node(node)
+
+        # Build provider text — all platforms in one line separated by • like screenshot
+        all_platforms = []
+        for mtype in ("FLATRATE", "FREE", "ADS"):
+            all_platforms.extend(providers.get(mtype, []))
+        buy_rent = []
+        for mtype in ("BUY", "RENT"):
+            buy_rent.extend(providers.get(mtype, []))
+
+        title_line = f"≡ **{title}** ({year})" if year else f"≡ **{title}**"
+        avail_line = "🔥 **Availability :-**\n"
+
+        if all_platforms:
+            avail_line += "• " + " •\n• ".join(all_platforms) + " •"
+        elif buy_rent:
+            avail_line += "• " + " • ".join(buy_rent) + " •\n_(Buy/Rent only)_"
         else:
-            await target.edit(text, parse_mode=MD, reply_markup=keyboard)
+            avail_line += "_Not available for streaming in India yet._"
+
+        jw_search = f"https://www.justwatch.com/in/search?q={query.replace(' ', '+')}"
+        credit_line = f"\nCC ~ @{BOT_USERNAME}"
+
+        text = f"{title_line}\n\n{avail_line}{credit_line}"
+
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton(
+                "🔍 JustWatch",
+                url=jw_search,
+            )
+        ]])
+
+        await target.reply(text, parse_mode=MD, reply_markup=keyboard)
 
     # ── /posters — Step 1: search & type picker ───────────────────────────────
     @app.on_message(filters.command("posters") & filters.private)
@@ -407,22 +452,20 @@ def register(app: Client):
         images  = detail.get("images", {})
         buckets = _classify_posters(images)
 
-        # Check we have at least one image
         total_imgs = sum(len(v) for v in buckets.values())
         if total_imgs == 0:
             await wait.edit("❌ No posters found for this title.")
             return
 
-        title   = detail.get("title") or detail.get("name", "")
-        year    = (detail.get("release_date") or detail.get("first_air_date", ""))[:4]
-        mtype   = hit["media_type"]
-        tmdb_id = detail["id"]
+        title    = detail.get("title") or detail.get("name", "")
+        year     = (detail.get("release_date") or detail.get("first_air_date", ""))[:4]
+        mtype    = hit["media_type"]
+        tmdb_id  = detail["id"]
         tmdb_url = f"https://www.themoviedb.org/{mtype}/{tmdb_id}"
 
-        # Store in session
         _poster_sessions[message.chat.id] = {
             "buckets":  buckets,
-            "type":     None,      # selected bucket key
+            "type":     None,
             "index":    0,
             "title":    f"{title} ({year})",
             "mtype":    mtype,
@@ -431,16 +474,27 @@ def register(app: Client):
         }
 
         await wait.delete()
+        await _send_type_picker(message, message.chat.id, reply=True)
 
-        # Build type picker keyboard — only show non-empty types
-        rows = []
-        pair = []
-        for key in ("landscape", "portrait", "clean_landscape"):
+    async def _send_type_picker(target, cid: int, reply: bool = False,
+                                 edit_msg=None):
+        s       = _poster_sessions.get(cid)
+        if not s:
+            return
+        buckets = s["buckets"]
+
+        rows, pair = [], []
+        key_order  = ("landscape", "portrait", "clean_landscape")
+        labels_map = {"portrait": "Portrait", "landscape": "Landscape",
+                      "clean_landscape": "Clean Landscape"}
+        for key in key_order:
             count = len(buckets[key])
             if count == 0:
                 continue
-            label = _type_label(key, count)
-            btn   = InlineKeyboardButton(label, callback_data=f"pt_type|{key}")
+            btn = InlineKeyboardButton(
+                f"{labels_map[key]} ({count})",
+                callback_data=f"pt_type|{key}",
+            )
             pair.append(btn)
             if len(pair) == 2:
                 rows.append(pair)
@@ -452,36 +506,38 @@ def register(app: Client):
             InlineKeyboardButton("❌ Close", callback_data="pt_close"),
         ])
 
-        await message.reply(
-            f"**{title} ({year})**\n\n"
-            f"TMDB : {tmdb_url}\n\n"
-            "**Select Poster Type :-**",
-            parse_mode=MD,
-            reply_markup=InlineKeyboardMarkup(rows),
+        text = (
+            f"**{s['title']}**\n\n"
+            f"TMDB : {s['tmdb_url']}\n\n"
+            "**Select Poster Type :-**"
         )
+        kb = InlineKeyboardMarkup(rows)
 
-    # ── /posters — Step 2: type selected → show first poster ─────────────────
+        if edit_msg:
+            try:
+                await edit_msg.edit(text, parse_mode=MD, reply_markup=kb)
+            except Exception:
+                await target.reply(text, parse_mode=MD, reply_markup=kb)
+        elif reply:
+            await target.reply(text, parse_mode=MD, reply_markup=kb)
+
     @app.on_callback_query(filters.regex(r"^pt_type\|"))
     async def poster_type_cb(client: Client, query: CallbackQuery):
         await query.answer()
-        cid     = query.message.chat.id
-        s       = _poster_sessions.get(cid)
+        cid  = query.message.chat.id
+        s    = _poster_sessions.get(cid)
         if not s:
             await query.answer("Session expired. Use /posters again.", show_alert=True)
             return
+        s["type"]  = query.data.split("|", 1)[1]
+        s["index"] = 0
+        await _send_poster_view(client, query.message, cid)
 
-        chosen_type         = query.data.split("|", 1)[1]
-        s["type"]           = chosen_type
-        s["index"]          = 0
-        await _send_poster_view(client, query.message, cid, edit=True)
-
-    # ── /posters — Navigation callbacks ──────────────────────────────────────
     @app.on_callback_query(filters.regex(r"^pt_(prev|next|first|last|back|close)$"))
     async def poster_nav_cb(client: Client, query: CallbackQuery):
         action = query.data.split("_", 1)[1]
         cid    = query.message.chat.id
         s      = _poster_sessions.get(cid)
-
         await query.answer()
 
         if action == "close":
@@ -490,38 +546,9 @@ def register(app: Client):
             return
 
         if action == "back":
-            # Go back to type picker
             if not s:
                 return
-            buckets  = s["buckets"]
-            rows     = []
-            pair     = []
-            for key in ("landscape", "portrait", "clean_landscape"):
-                count = len(buckets[key])
-                if count == 0:
-                    continue
-                label = _type_label(key, count)
-                btn   = InlineKeyboardButton(label, callback_data=f"pt_type|{key}")
-                pair.append(btn)
-                if len(pair) == 2:
-                    rows.append(pair)
-                    pair = []
-            if pair:
-                rows.append(pair)
-            rows.append([
-                InlineKeyboardButton("🔙 Back",  callback_data="pt_close"),
-                InlineKeyboardButton("❌ Close", callback_data="pt_close"),
-            ])
-            try:
-                await query.message.edit(
-                    f"**{s['title']}**\n\n"
-                    f"TMDB : {s['tmdb_url']}\n\n"
-                    "**Select Poster Type :-**",
-                    parse_mode=MD,
-                    reply_markup=InlineKeyboardMarkup(rows),
-                )
-            except Exception:
-                pass
+            await _send_type_picker(query.message, cid, edit_msg=query.message)
             return
 
         if not s or not s.get("type"):
@@ -536,9 +563,13 @@ def register(app: Client):
         elif action == "first": s["index"] = 0
         elif action == "last":  s["index"] = total - 1
 
-        await _send_poster_view(client, query.message, cid, edit=True)
+        await _send_poster_view(client, query.message, cid)
 
-    async def _send_poster_view(client: Client, msg, cid: int, edit: bool = False):
+    @app.on_callback_query(filters.regex(r"^pt_noop$"))
+    async def poster_noop_cb(client: Client, query: CallbackQuery):
+        await query.answer()
+
+    async def _send_poster_view(client: Client, msg, cid: int):
         s     = _poster_sessions.get(cid)
         if not s or not s.get("type"):
             return
@@ -548,13 +579,9 @@ def register(app: Client):
         total = len(items)
         p     = items[idx]
 
-        # Poster metadata
-        ar    = p.get("aspect_ratio", 1)
-        ptype = {
-            "portrait":        "Portrait",
-            "landscape":       "Landscape",
-            "clean_landscape": "Clean Landscape",
-        }.get(s["type"], "Unknown")
+        ptype_map = {"portrait": "Portrait", "landscape": "Landscape",
+                     "clean_landscape": "Clean Landscape"}
+        ptype = ptype_map.get(s["type"], "Unknown")
         lang  = (p.get("iso_639_1") or "N/A").upper()
         w, h  = p.get("width", 0), p.get("height", 0)
         url   = f"https://image.tmdb.org/t/p/original{p['file_path']}"
@@ -567,36 +594,23 @@ def register(app: Client):
             f"• Width: {w}, Height: {h}\n"
             f"• [Click Here]({url})"
         )
-
-        # Navigation: <<  <  idx/total  >  >>
         nav = [
-            InlineKeyboardButton("<<",  callback_data="pt_first"),
-            InlineKeyboardButton("<",   callback_data="pt_prev"),
+            InlineKeyboardButton("<<", callback_data="pt_first"),
+            InlineKeyboardButton("<",  callback_data="pt_prev"),
             InlineKeyboardButton(f"{idx+1}/{total}", callback_data="pt_noop"),
-            InlineKeyboardButton(">",   callback_data="pt_next"),
-            InlineKeyboardButton(">>",  callback_data="pt_last"),
+            InlineKeyboardButton(">",  callback_data="pt_next"),
+            InlineKeyboardButton(">>", callback_data="pt_last"),
         ]
-        ctrl = [
+        ctrl    = [
             InlineKeyboardButton("🔙 Back",  callback_data="pt_back"),
             InlineKeyboardButton("❌ Close", callback_data="pt_close"),
         ]
         keyboard = InlineKeyboardMarkup([nav, ctrl])
 
-        if edit:
-            # Delete old message and send new photo (edit_media on photo is cleaner)
-            try:
-                await msg.delete()
-            except Exception:
-                pass
-            await client.send_photo(
-                cid, url, caption=caption, parse_mode=MD, reply_markup=keyboard,
-            )
-        else:
-            await client.send_photo(
-                cid, url, caption=caption, parse_mode=MD, reply_markup=keyboard,
-            )
-
-    # Handle the noop button (counter display)
-    @app.on_callback_query(filters.regex(r"^pt_noop$"))
-    async def poster_noop_cb(client: Client, query: CallbackQuery):
-        await query.answer()
+        try:
+            await msg.delete()
+        except Exception:
+            pass
+        await client.send_photo(
+            cid, url, caption=caption, parse_mode=MD, reply_markup=keyboard,
+        )

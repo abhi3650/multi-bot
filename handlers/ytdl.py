@@ -133,7 +133,14 @@ def register(app: Client):
                 "quiet":        True,
                 "skip_download": True,
                 "noplaylist":   True,
-                "extractor_args": {"youtube": {"player_client": ["android"]}},
+                "extractor_args": {"youtube": {"player_client": ["tv_embedded", "web"]}},
+                "http_headers": {
+                    "User-Agent": (
+                        "Mozilla/5.0 (SMART-TV; Linux; Tizen 5.0) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "SamsungBrowser/2.1 Chrome/56.0.2924.0 TV Safari/537.36"
+                    )
+                },
             }) as ydl:
                 return ydl.extract_info(url, download=False)
 
@@ -300,7 +307,14 @@ def register(app: Client):
                 "format":         "bestaudio/best",
                 "outtmpl":        os.path.join(tmp, "%(id)s.%(ext)s"),
                 "quiet":          True,
-                "extractor_args": {"youtube": {"player_client": ["android"]}},
+                "extractor_args": {"youtube": {"player_client": ["tv_embedded", "web"]}},
+                "http_headers": {
+                    "User-Agent": (
+                        "Mozilla/5.0 (SMART-TV; Linux; Tizen 5.0) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "SamsungBrowser/2.1 Chrome/56.0.2924.0 TV Safari/537.36"
+                    )
+                },
                 "postprocessors": [
                     {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"},
                     {"key": "FFmpegMetadata",     "add_metadata": True},

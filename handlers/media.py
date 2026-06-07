@@ -1,22 +1,17 @@
 """
 handlers/media.py  —  /mediainfo  /sample  /screenshot
 
-Large-file strategy:
-  Pyrogram client.download_media() uses MTProto — no 20 MB Bot API cap.
-  Files of any size can be downloaded and processed.
-
-Usage modes:
-  Reply to a video/document  →  processes that file
-  Pass a URL                 →  resolves via yt-dlp, processes stream
+ffmpeg strategy:
+  Uses imageio.plugins.ffmpeg to auto-download a static ffmpeg binary
+  on first run — works on any cloud host even without system ffmpeg/ffprobe.
+  Falls back to system ffmpeg if already installed.
 """
 
 import asyncio
-import io
 import os
 import subprocess
 import tempfile
 
-import ffmpeg
 import httpx
 import yt_dlp
 from pyrogram import Client, filters
@@ -34,6 +29,81 @@ SCREENSHOT_COUNT = 10
 _SECTION_EMOJI = {
     "General": "🗒", "Video": "🎞", "Audio": "🔊", "Text": "🔠", "Menu": "🗃",
 }
+
+# ── ffmpeg binary resolution ──────────────────────────────────────────────────
+# Try system first; fall back to imageio's auto-downloaded static binary.
+
+def _find_ffmpeg() -> tuple[str, str]:
+    """Return (ffmpeg_path, ffprobe_path). Downloads static binary if needed."""
+    import shutil
+
+    ff  = shutil.which("ffmpeg")
+    ffp = shutil.which("ffprobe")
+
+    if ff and ffp:
+        return ff, ffp
+
+    # Use imageio to get a static binary
+    try:
+        import imageio_ffmpeg as ioff
+        ff  = ioff.get_ffmpeg_exe()
+        # imageio only ships ffmpeg; derive ffprobe path from same dir
+        ffp_candidate = os.path.join(os.path.dirname(ff), "ffprobe")
+        if os.path.exists(ffp_candidate):
+            return ff, ffp_candidate
+        # No ffprobe alongside — use ffmpeg for probing too (via -show_streams flag)
+        return ff, ff   # we'll handle ffprobe-only calls specially
+    except Exception:
+        pass
+
+    return "ffmpeg", "ffprobe"   # last resort; will fail with clear error
+
+
+_FFMPEG, _FFPROBE = _find_ffmpeg()
+
+
+def _probe(src: str) -> dict:
+    """Run ffprobe (or ffmpeg -hide_banner) to get stream info."""
+    import json
+
+    # Try with the resolved ffprobe
+    exe = _FFPROBE if _FFPROBE != _FFMPEG else _FFMPEG
+
+    if exe == _FFMPEG:
+        # Use ffmpeg itself to probe
+        cmd = [
+            _FFMPEG, "-hide_banner", "-v", "quiet",
+            "-print_format", "json", "-show_format", "-show_streams",
+            "-i", src,
+        ]
+    else:
+        cmd = [
+            exe, "-v", "quiet",
+            "-print_format", "json",
+            "-show_format", "-show_streams",
+            src,
+        ]
+
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        text = r.stdout or r.stderr
+        # ffprobe puts json in stdout; ffmpeg -print_format puts it in stderr
+        for candidate in (r.stdout, r.stderr):
+            if candidate and candidate.strip().startswith("{"):
+                return json.loads(candidate)
+    except Exception:
+        pass
+    return {}
+
+
+def _run_ff_cmd(args: list[str]) -> bool:
+    """Run an ffmpeg command. Returns True on success."""
+    cmd = [_FFMPEG] + args
+    try:
+        r = subprocess.run(cmd, capture_output=True, timeout=300)
+        return r.returncode == 0
+    except Exception:
+        return False
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -53,7 +123,6 @@ def _limit_err(allowed: bool, used: int, limit: int) -> str | None:
 
 
 def _get_video_from_reply(message: Message):
-    """Return (media_obj, filename, size_bytes) from the replied-to message."""
     r = message.reply_to_message
     if not r:
         return None, None, 0
@@ -65,14 +134,12 @@ def _get_video_from_reply(message: Message):
 
 
 async def _download_tg(client: Client, media_obj, dest_dir: str, filename: str) -> str:
-    """Download via Pyrogram MTProto — no size limit."""
     dest = os.path.join(dest_dir, filename)
     await client.download_media(media_obj, file_name=dest)
     return dest
 
 
 async def _ydl_stream_url(url: str) -> dict:
-    """Resolve a social/YT URL to a direct CDN stream URL via yt-dlp."""
     social = ("youtube.com", "youtu.be", "vimeo.com", "instagram.com",
                "twitter.com", "tiktok.com", "facebook.com")
     if not any(s in url for s in social):
@@ -83,7 +150,7 @@ async def _ydl_stream_url(url: str) -> dict:
             "quiet":        True,
             "skip_download": True,
             "format":       "bestvideo[ext=mp4][height<=1080]+bestaudio[ext=m4a]/best[ext=mp4]/best",
-            "extractor_args": {"youtube": {"player_client": ["android"]}},
+            "extractor_args": {"youtube": {"player_client": ["web", "android"]}},
         }) as ydl:
             info = ydl.extract_info(url, download=False)
             fmts = info.get("requested_formats") or []
@@ -102,22 +169,11 @@ async def _ydl_stream_url(url: str) -> dict:
         return {"single": url}
 
 
-def _probe(src: str) -> dict:
-    try:
-        return ffmpeg.probe(src)
-    except ffmpeg.Error:
-        return {}
-
-
 def _duration(data: dict) -> float:
     try:
         return float(data.get("format", {}).get("duration", 0))
     except (ValueError, TypeError):
         return 0.0
-
-
-async def _run_ff(node):
-    await asyncio.to_thread(lambda: node.overwrite_output().run(capture_output=True))
 
 
 def _has_mediainfo() -> bool:
@@ -137,7 +193,6 @@ def _run_mediainfo(path: str) -> str | None:
 
 
 async def _post_telegraph(filename: str, raw: str) -> str | None:
-    """Post mediainfo CLI output to Telegraph and return the page URL."""
     lines   = raw.split("\n")
     nodes   = []
     section = []
@@ -223,7 +278,6 @@ def _build_ffprobe_text(data: dict, name: str) -> str:
 def register(app: Client):
 
     # ── /mediainfo ────────────────────────────────────────────────────────────
-
     @app.on_message(filters.command("mediainfo") & filters.private)
     async def cmd_mediainfo(client: Client, message: Message):
         u = message.from_user
@@ -234,7 +288,6 @@ def register(app: Client):
             return
 
         args = message.command[1:]
-
         if args and args[0].startswith("http"):
             wait = await message.reply("⏳ Fetching media info from URL…")
             info = await _ydl_stream_url(args[0])
@@ -265,22 +318,19 @@ def register(app: Client):
             await _do_mediainfo(wait, path, fname)
 
     async def _do_mediainfo(wait, src: str, name: str):
-        # Try mediainfo CLI first (richest output → Telegraph page)
         if _has_mediainfo():
             raw = await asyncio.to_thread(_run_mediainfo, src)
             if raw:
                 tg_url = await _post_telegraph(name, raw)
                 if tg_url:
                     await wait.edit(
-                        f"📊 **MediaInfo — {name}**\n\n"
-                        f"Full report ready 👇",
+                        f"📊 **MediaInfo — {name}**\n\nFull report ready 👇",
                         parse_mode=MD,
                         reply_markup=InlineKeyboardMarkup([[
                             InlineKeyboardButton("📄 View Full Report", url=tg_url)
                         ]]),
                     )
                     return
-                # Telegraph failed — show first 60 non-empty lines inline
                 lines = [l for l in raw.split("\n") if l.strip()][:60]
                 await wait.edit(
                     f"📊 **{name}**\n\n```\n" + "\n".join(lines) + "\n```",
@@ -288,15 +338,17 @@ def register(app: Client):
                 )
                 return
 
-        # Fallback: ffprobe
         data = await asyncio.to_thread(_probe, src)
         if not data:
-            await wait.edit("❌ Could not read media info from this file.")
+            await wait.edit(
+                "❌ Could not read media info.\n"
+                "_Make sure ffmpeg is installed on the server._",
+                parse_mode=MD,
+            )
             return
         await wait.edit(_build_ffprobe_text(data, name), parse_mode=MD)
 
     # ── /sample ───────────────────────────────────────────────────────────────
-
     @app.on_message(filters.command("sample") & filters.private)
     async def cmd_sample(client: Client, message: Message):
         u = message.from_user
@@ -307,7 +359,6 @@ def register(app: Client):
             return
 
         args = message.command[1:]
-
         if args and args[0].startswith("http"):
             wait  = await message.reply("⏳ Generating 30s sample clip from URL…")
             info  = await _ydl_stream_url(args[0])
@@ -327,7 +378,9 @@ def register(app: Client):
             return
 
         size_str = f"{fsize/1024/1024:.1f} MB" if fsize else "unknown size"
-        wait     = await message.reply(f"⏳ Downloading `{fname}` ({size_str}) and creating sample…", parse_mode=MD)
+        wait     = await message.reply(
+            f"⏳ Downloading `{fname}` ({size_str}) and creating sample…", parse_mode=MD
+        )
 
         with tempfile.TemporaryDirectory() as tmp:
             try:
@@ -338,7 +391,8 @@ def register(app: Client):
             await _make_sample(client, message, wait,
                                 {"single": path}, os.path.splitext(fname)[0])
 
-    async def _make_sample(client: Client, message: Message, wait, stream_info: dict, label: str):
+    async def _make_sample(client: Client, message: Message, wait,
+                            stream_info: dict, label: str):
         with tempfile.TemporaryDirectory() as tmp:
             out = os.path.join(tmp, "sample.mp4")
             src = stream_info.get("single") or stream_info.get("video")
@@ -346,32 +400,39 @@ def register(app: Client):
             data = await asyncio.to_thread(_probe, src)
             dur  = _duration(data)
             if dur < 10:
-                await wait.edit("❌ Video is too short to generate a sample (minimum 10 seconds).")
+                await wait.edit("❌ Video is too short to generate a sample (minimum 10s).")
                 return
 
             start = max(10.0, dur * 0.15)
-            try:
-                if "single" in stream_info:
-                    node = (ffmpeg
-                            .input(stream_info["single"], ss=start, t=30)
-                            .output(out, **{
-                                "c:v": "libx264", "preset": "fast", "crf": "28",
-                                "c:a": "aac", "b:a": "128k", "movflags": "+faststart",
-                            }))
-                else:
-                    v    = ffmpeg.input(stream_info["video"], ss=start, t=30)
-                    a    = ffmpeg.input(stream_info["audio"], ss=start, t=30)
-                    node = ffmpeg.output(v["v"], a["a"], out, **{
-                        "c:v": "libx264", "preset": "fast", "crf": "28",
-                        "c:a": "aac", "b:a": "128k", "movflags": "+faststart",
-                    })
-                await _run_ff(node)
-            except Exception as e:
-                await wait.edit(f"❌ Sample generation failed:\n`{e}`", parse_mode=MD)
-                return
 
-            if not os.path.exists(out):
-                await wait.edit("❌ Sample generation produced no output.")
+            def _do_sample():
+                if "single" in stream_info:
+                    return _run_ff_cmd([
+                        "-ss", str(start), "-i", stream_info["single"],
+                        "-t", "30",
+                        "-c:v", "libx264", "-preset", "fast", "-crf", "28",
+                        "-c:a", "aac", "-b:a", "128k",
+                        "-movflags", "+faststart",
+                        "-y", out,
+                    ])
+                else:
+                    return _run_ff_cmd([
+                        "-ss", str(start), "-i", stream_info["video"],
+                        "-ss", str(start), "-i", stream_info["audio"],
+                        "-t", "30",
+                        "-c:v", "libx264", "-preset", "fast", "-crf", "28",
+                        "-c:a", "aac", "-b:a", "128k",
+                        "-movflags", "+faststart",
+                        "-y", out,
+                    ])
+
+            ok = await asyncio.to_thread(_do_sample)
+            if not ok or not os.path.exists(out):
+                await wait.edit(
+                    "❌ Sample generation failed.\n"
+                    "_Make sure ffmpeg is installed on the server._",
+                    parse_mode=MD,
+                )
                 return
 
             out_size = os.path.getsize(out) / 1024 / 1024
@@ -388,7 +449,6 @@ def register(app: Client):
             )
 
     # ── /screenshot ───────────────────────────────────────────────────────────
-
     @app.on_message(filters.command("screenshot") & filters.private)
     async def cmd_screenshot(client: Client, message: Message):
         u = message.from_user
@@ -399,7 +459,6 @@ def register(app: Client):
             return
 
         args = message.command[1:]
-
         if args and args[0].startswith("http"):
             wait  = await message.reply(f"⏳ Taking {SCREENSHOT_COUNT} screenshots from URL…")
             info  = await _ydl_stream_url(args[0])
@@ -433,13 +492,14 @@ def register(app: Client):
             await _take_shots(client, message, wait,
                                {"single": path}, os.path.splitext(fname)[0])
 
-    async def _take_shots(client: Client, message: Message, wait, stream_info: dict, label: str):
+    async def _take_shots(client: Client, message: Message, wait,
+                           stream_info: dict, label: str):
         with tempfile.TemporaryDirectory() as tmp:
             src  = stream_info.get("single") or stream_info.get("video")
             data = await asyncio.to_thread(_probe, src)
             dur  = _duration(data)
             if dur < 10:
-                await wait.edit("❌ Video is too short to take screenshots (minimum 10 seconds).")
+                await wait.edit("❌ Video is too short (minimum 10 seconds).")
                 return
 
             margin = dur * 0.05
@@ -447,19 +507,25 @@ def register(app: Client):
             times  = [margin + step * i for i in range(SCREENSHOT_COUNT)]
             labels = [f"{int(t)}s" for t in times]
 
-            async def _shot(i: int, t: float) -> str | None:
+            def _take_one(i: int, t: float) -> str | None:
                 path = os.path.join(tmp, f"shot_{i:02d}.jpg")
-                try:
-                    node = ffmpeg.input(src, ss=t).output(path, vframes=1, **{"q:v": "2"})
-                    await _run_ff(node)
-                    return path if os.path.exists(path) else None
-                except Exception:
-                    return None
+                ok = _run_ff_cmd([
+                    "-ss", str(t), "-i", src,
+                    "-vframes", "1", "-q:v", "2",
+                    "-y", path,
+                ])
+                return path if ok and os.path.exists(path) else None
 
-            shots = await asyncio.gather(*[_shot(i, t) for i, t in enumerate(times)])
+            shots = await asyncio.gather(
+                *[asyncio.to_thread(_take_one, i, t) for i, t in enumerate(times)]
+            )
             shots = [s for s in shots if s]
             if not shots:
-                await wait.edit("❌ Could not generate any screenshots.")
+                await wait.edit(
+                    "❌ Could not generate screenshots.\n"
+                    "_Make sure ffmpeg is installed on the server._",
+                    parse_mode=MD,
+                )
                 return
 
             caption = (

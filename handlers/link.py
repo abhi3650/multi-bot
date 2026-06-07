@@ -2,8 +2,10 @@
 handlers/link.py  —  /link command
 Reply to any file/video/audio to get Watch Online + Download links.
 
-Pyrogram available (API_ID+API_HASH set)  → MTProto streaming, any file size
-Pyrogram unavailable                       → CDN proxy (≤ 20 MB Bot API cap)
+BUTTON_URL_INVALID fix:
+  Telegram rejects localhost/private URLs in inline buttons.
+  If STREAM_BASE_URL is not a public URL we skip the buttons and
+  send the raw file info instead.
 """
 
 from mimetypes import guess_type
@@ -33,6 +35,16 @@ def _human_size(n: int) -> str:
     return f"{n:.1f} TB"
 
 
+def _is_public_url(url: str) -> bool:
+    """Check if the URL is publicly reachable (not localhost/private IP)."""
+    if not url:
+        return False
+    private = ("localhost", "127.", "192.168.", "10.", "172.16.", "172.17.",
+                "172.18.", "172.19.", "172.2", "172.3", "0.0.0.0")
+    lower = url.lower()
+    return not any(p in lower for p in private)
+
+
 def register(app: Client):
 
     @app.on_message(filters.command("link") & filters.private)
@@ -51,7 +63,7 @@ def register(app: Client):
             )
             return
 
-        # ── Identify media object ──────────────────────────────────────────────
+        # ── Identify media ─────────────────────────────────────────────────────
         media_obj = filename = mime = None
         size = 0
 
@@ -74,15 +86,19 @@ def register(app: Client):
             mime      = r.audio.mime_type or "audio/mpeg"
 
         if not media_obj:
-            await message.reply("❌ Please reply to a **video**, **document**, or **audio** file.", parse_mode=MD)
+            await message.reply(
+                "❌ Please reply to a **video**, **document**, or **audio** file.",
+                parse_mode=MD,
+            )
             return
 
         wait     = await message.reply("⏳ Generating link…")
         size_str = _human_size(size)
+        use_stream = _is_public_url(STREAM_BASE_URL)
 
-        # ── Path A: Pyrogram MTProto — no size limit ───────────────────────────
+        # ── Path A: Pyrogram MTProto — unlimited size ──────────────────────────
         if pyro.is_available():
-            if STREAM_BASE_URL:
+            if use_stream:
                 token     = create_token(filename, size, mime, tg_file_id=media_obj.file_id)
                 base      = STREAM_BASE_URL.rstrip("/")
                 watch_url = f"{base}/watch/{token}"
@@ -100,32 +116,37 @@ def register(app: Client):
                     InlineKeyboardButton("⬇️ Download",     url=dl_url),
                 ]]
                 await wait.delete()
-                await message.reply(text, parse_mode=MD, reply_markup=InlineKeyboardMarkup(buttons))
+                await message.reply(
+                    text, parse_mode=MD, reply_markup=InlineKeyboardMarkup(buttons)
+                )
             else:
+                # STREAM_BASE_URL is localhost or missing — can't make public buttons
                 await wait.edit(
-                    f"🔗 **{filename}** • `{size_str}` • Pyrogram ✅\n\n"
-                    "⚠️ Set `STREAM_BASE_URL` in your `.env` to enable Watch/Download pages.\n\n"
-                    "Example:\n`STREAM_BASE_URL=http://YOUR_SERVER_IP:8080`",
+                    f"🔗 **{filename}**\n"
+                    f"💾 Size: `{size_str}` | 🚀 Pyrogram: ✅\n\n"
+                    "⚠️ **Set a public `STREAM_BASE_URL`** in your `.env` to generate\n"
+                    "Watch/Download links that Telegram can open.\n\n"
+                    "Example:\n`STREAM_BASE_URL=https://your-domain.com`\n"
+                    "_`localhost` URLs are rejected by Telegram._",
                     parse_mode=MD,
                 )
             return
 
-        # ── Path B: Bot API CDN proxy — ≤ 20 MB only ─────────────────────────
+        # ── Path B: Bot API CDN proxy — ≤ 20 MB ───────────────────────────────
         try:
             tg_file = await client.get_file(media_obj.file_id)
             cdn_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{tg_file.file_path}"
         except Exception:
             await wait.edit(
                 f"❌ **File too large** ({size_str}) for the Bot API 20 MB limit.\n\n"
-                "To stream large files, add your Telegram API credentials to `.env`:\n"
-                "`API_ID=your_api_id`\n"
-                "`API_HASH=your_api_hash`\n\n"
-                "Get them free at https://my.telegram.org/apps",
+                "Add Telegram API credentials to `.env` for unlimited size:\n"
+                "`API_ID=your_api_id`\n`API_HASH=your_api_hash`\n\n"
+                "Get them free from https://my.telegram.org/apps",
                 parse_mode=MD,
             )
             return
 
-        if STREAM_BASE_URL:
+        if use_stream:
             token     = create_token(filename, size, mime, cdn_url=cdn_url)
             base      = STREAM_BASE_URL.rstrip("/")
             watch_url = f"{base}/watch/{token}"
@@ -143,11 +164,13 @@ def register(app: Client):
                 InlineKeyboardButton("⬇️ Download",     url=dl_url),
             ]]
             await wait.delete()
-            await message.reply(text, parse_mode=MD, reply_markup=InlineKeyboardMarkup(buttons))
+            await message.reply(
+                text, parse_mode=MD, reply_markup=InlineKeyboardMarkup(buttons)
+            )
         else:
             await wait.edit(
                 f"🔗 **{filename}** • `{size_str}`\n\n"
-                f"⬇️ Direct link _(expires ~1h)_:\n`{cdn_url}`\n\n"
-                "_Tip: Set `STREAM_BASE_URL` for proper Watch/Download pages._",
+                f"⬇️ Direct CDN link _(expires ~1h)_:\n`{cdn_url}`\n\n"
+                "_Set a public `STREAM_BASE_URL` for Watch/Download pages._",
                 parse_mode=MD,
             )

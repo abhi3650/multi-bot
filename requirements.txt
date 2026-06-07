@@ -5,7 +5,7 @@ aiosqlite==0.20.0
 python-dotenv==1.0.1
 yt-dlp==2024.5.27
 ffmpeg-python==0.2.0
-ffprobe-python==1.0.3
+imageio[ffmpeg]==2.34.2
 mutagen==1.47.0
 Pillow==10.3.0
 aiohttp==3.9.5
