@@ -90,7 +90,7 @@ async def main() -> None:
 
     # Database
     await db.init_db()
-    logger.info("Database initialised.")
+    logger.info("MongoDB connected and indexes created.")
 
     # Pyrogram MTProto helper (large file streaming)
     await pyro.start(API_ID, API_HASH, BOT_TOKEN)

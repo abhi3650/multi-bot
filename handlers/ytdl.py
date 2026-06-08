@@ -27,6 +27,7 @@ from pyrogram.types import (
 )
 
 import database as db
+from cookie_helper import get_cookie_file
 
 MD = ParseMode.MARKDOWN
 
@@ -142,7 +143,7 @@ def _find_file(directory: str, ext: str) -> str | None:
 
 
 def _ydl_base_opts(extra: dict | None = None) -> dict:
-    """Base yt-dlp options that bypass YouTube bot detection."""
+    """Base yt-dlp options — uses cookies when COOKIE_FILE is configured."""
     opts = {
         "quiet":          True,
         "no_warnings":    True,
@@ -153,6 +154,7 @@ def _ydl_base_opts(extra: dict | None = None) -> dict:
             }
         },
     }
+    # Cookie file is loaded dynamically from MongoDB per-request (see _apply_cookies)
     if extra:
         opts.update(extra)
     return opts
@@ -212,8 +214,13 @@ def register(app: Client):
 
         wait = await message.reply("⏳ Fetching video info…")
 
+        cookie_path = await get_cookie_file()
+
         def _extract():
-            opts = _ydl_base_opts({"skip_download": True, "noplaylist": True})
+            extra = {"skip_download": True, "noplaylist": True}
+            if cookie_path:
+                extra["cookiefile"] = cookie_path
+            opts = _ydl_base_opts(extra)
             with yt_dlp.YoutubeDL(opts) as ydl:
                 return ydl.extract_info(url, download=False)
 
@@ -372,7 +379,9 @@ def register(app: Client):
         with tempfile.TemporaryDirectory() as tmp:
             hook = await _make_progress_hook(status, f"⬇️ Downloading: **{title[:40]}**")
 
-            ydl_opts = _ydl_base_opts({
+            cookie_path = await get_cookie_file(tmp_dir=tmp)
+
+            extra_dl: dict = {
                 "format":   "bestaudio/best",
                 "outtmpl":  os.path.join(tmp, "%(id)s.%(ext)s"),
                 "progress_hooks": [hook],
@@ -381,7 +390,10 @@ def register(app: Client):
                      "preferredcodec": "mp3", "preferredquality": "192"},
                     {"key": "FFmpegMetadata", "add_metadata": True},
                 ],
-            })
+            }
+            if cookie_path:
+                extra_dl["cookiefile"] = cookie_path
+            ydl_opts = _ydl_base_opts(extra_dl)
 
             def _dl():
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:

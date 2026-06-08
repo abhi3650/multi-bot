@@ -31,6 +31,7 @@ from pyrogram.types import (
 )
 
 import database as db
+from cookie_helper import get_cookie_file
 
 MD = ParseMode.MARKDOWN
 
@@ -102,7 +103,7 @@ def _embed_art(mp3_path: str, thumb_data: bytes, title: str, artist: str):
 
 
 def _ydl_base() -> dict:
-    return {
+    opts = {
         "quiet":          True,
         "no_warnings":    True,
         "extractor_args": {
@@ -112,6 +113,7 @@ def _ydl_base() -> dict:
             }
         },
     }
+    return opts
 
 
 async def _make_progress_hook(status_msg, title: str):
@@ -179,8 +181,12 @@ def register(app: Client):
         query = " ".join(args)
         wait  = await message.reply("🔍 Searching…")
 
+        cookie_path_search = await get_cookie_file()
+
         def _search():
             opts = {**_ydl_base(), "extract_flat": True, "noplaylist": False}
+            if cookie_path_search:
+                opts["cookiefile"] = cookie_path_search
             with yt_dlp.YoutubeDL(opts) as ydl:
                 return ydl.extract_info(f"ytsearch8:{query}", download=False)
 
@@ -257,7 +263,8 @@ def register(app: Client):
                 pass
 
         with tempfile.TemporaryDirectory() as tmp:
-            hook = await _make_progress_hook(query.message, title)
+            hook        = await _make_progress_hook(query.message, title)
+            cookie_path = await get_cookie_file(tmp_dir=tmp)
 
             ydl_opts = {
                 **_ydl_base(),
@@ -270,6 +277,8 @@ def register(app: Client):
                     {"key": "FFmpegMetadata", "add_metadata": True},
                 ],
             }
+            if cookie_path:
+                ydl_opts["cookiefile"] = cookie_path
 
             def _dl():
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:

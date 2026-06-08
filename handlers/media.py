@@ -26,6 +26,7 @@ from pyrogram.types import (
 )
 
 import database as db
+from cookie_helper import get_cookie_file
 from config import BOT_TOKEN
 
 MD               = ParseMode.MARKDOWN
@@ -232,6 +233,10 @@ async def _ydl_stream_url(url: str) -> dict:
                 "player_skip":   ["webpage"],
             }},
         }
+        # _cookie_path is set by the async caller before this thread runs
+        if _cookie_path:
+            opts["cookiefile"] = _cookie_path
+
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=False)
             fmts = info.get("requested_formats") or []
@@ -243,6 +248,8 @@ async def _ydl_stream_url(url: str) -> dict:
                 if v and a:
                     return {"video": v, "audio": a}
             return {"single": info.get("url") or url}
+    _cookie_path = await get_cookie_file()
+
     try:
         return await asyncio.to_thread(_extract)
     except Exception:

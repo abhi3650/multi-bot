@@ -14,4 +14,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
+# If you have a cookies.txt file, place it in the project root
+# and it will be available at /app/cookies.txt
+# Set COOKIE_FILE=/app/cookies.txt in your environment variables
+
 CMD ["python", "bot.py"]
