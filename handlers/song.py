@@ -1,15 +1,14 @@
 """
 handlers/song.py  —  /song command
 
-Flow (matches UI screenshots exactly):
-  1. User sends /song NoCopyrights
-  2. Bot replies with "Search Results (YT Music):" + one button per result
-  3. User taps a button
-  4. Status: "Preparing Your Song..."  →  "Downloading ..."  →  "Uploading ..."
-  5. Bot sends the MP3 audio file with caption:
-       🎵 Song   : <title>
-       🎤 Artist  : <artist>
-       📀 Source  : YT Music
+YouTube sign-in fix: uses mweb + ios player clients (same as ytdl.py).
+Progress bar: yt-dlp progress_hook → live Telegram message updates.
+
+Flow:
+  1. /song <query> → "Search Results (YT Music):" + buttons
+  2. Tap → "Preparing Your Song..." → progress bar while downloading
+  3. "Uploading..." → send MP3 with album art
+  Caption: 🎵 Song / 🎤 Artist / 📀 Source: YT Music
 """
 
 import asyncio
@@ -17,6 +16,7 @@ import hashlib
 import io
 import os
 import tempfile
+import time
 
 import httpx
 from PIL import Image
@@ -34,8 +34,10 @@ import database as db
 
 MD = ParseMode.MARKDOWN
 
-# In-memory session store: { session_key: { video_id: entry_dict } }
 _sessions: dict[str, dict] = {}
+
+# Same client chain as ytdl.py
+_PLAYER_CLIENTS = ["mweb", "ios", "tv_embedded", "web"]
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -63,8 +65,20 @@ def _find_mp3(directory: str) -> str | None:
     return None
 
 
+def _bar(pct: float, width: int = 10) -> str:
+    filled = int(pct / 100 * width)
+    return "█" * filled + "░" * (width - filled)
+
+
+def _human_speed(bps: float) -> str:
+    if bps >= 1_000_000:
+        return f"{bps/1_000_000:.1f} MB/s"
+    if bps >= 1_000:
+        return f"{bps/1_000:.0f} KB/s"
+    return f"{bps:.0f} B/s"
+
+
 def _embed_art(mp3_path: str, thumb_data: bytes, title: str, artist: str):
-    """Embed album art + ID3 tags. Works in VLC, WMP, Apple Music, foobar2000."""
     try:
         img = Image.open(io.BytesIO(thumb_data))
         if img.mode != "RGB":
@@ -87,11 +101,65 @@ def _embed_art(mp3_path: str, thumb_data: bytes, title: str, artist: str):
         print(f"[song/embed] {e}")
 
 
+def _ydl_base() -> dict:
+    return {
+        "quiet":          True,
+        "no_warnings":    True,
+        "extractor_args": {
+            "youtube": {
+                "player_client": _PLAYER_CLIENTS,
+                "player_skip":   ["webpage"],
+            }
+        },
+    }
+
+
+async def _make_progress_hook(status_msg, title: str):
+    last_edit = [0.0]
+
+    def hook(d: dict):
+        if d.get("status") != "downloading":
+            return
+        now = time.time()
+        if now - last_edit[0] < 2.0:
+            return
+        last_edit[0] = now
+
+        downloaded = d.get("downloaded_bytes") or 0
+        total      = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
+        speed      = d.get("speed") or 0
+        eta        = d.get("eta") or 0
+
+        if total:
+            pct  = downloaded / total * 100
+            bar  = _bar(pct)
+            size = f"{downloaded/1_048_576:.1f}/{total/1_048_576:.1f} MB"
+        else:
+            pct  = 0
+            bar  = "░" * 10
+            size = f"{downloaded/1_048_576:.1f} MB"
+
+        text = (
+            f"Downloading ...\n\n"
+            f"🎵 **{title[:40]}**\n\n"
+            f"`{bar}` {pct:.0f}%\n"
+            f"📦 {size}\n"
+            f"⚡ {_human_speed(speed)}  •  ⏳ {eta}s"
+        )
+
+        asyncio.get_event_loop().call_soon_threadsafe(
+            lambda: asyncio.ensure_future(
+                status_msg.edit(text, parse_mode=MD)
+            )
+        )
+
+    return hook
+
+
 # ── Handler registration ──────────────────────────────────────────────────────
 
 def register(app: Client):
 
-    # ── /song ─────────────────────────────────────────────────────────────────
     @app.on_message(filters.command("song") & filters.private)
     async def cmd_song(client: Client, message: Message):
         u = message.from_user
@@ -111,21 +179,9 @@ def register(app: Client):
         query = " ".join(args)
         wait  = await message.reply("🔍 Searching…")
 
-        # ── Search YouTube Music ───────────────────────────────────────────────
         def _search():
-            with yt_dlp.YoutubeDL({
-                "quiet":          True,
-                "extract_flat":   True,
-                "noplaylist":     False,
-                "extractor_args": {"youtube": {"player_client": ["tv_embedded", "web"]}},
-                "http_headers":   {
-                    "User-Agent": (
-                        "Mozilla/5.0 (SMART-TV; Linux; Tizen 5.0) "
-                        "AppleWebKit/537.36 (KHTML, like Gecko) "
-                        "SamsungBrowser/2.1 Chrome/56.0.2924.0 TV Safari/537.36"
-                    )
-                },
-            }) as ydl:
+            opts = {**_ydl_base(), "extract_flat": True, "noplaylist": False}
+            with yt_dlp.YoutubeDL(opts) as ydl:
                 return ydl.extract_info(f"ytsearch8:{query}", download=False)
 
         try:
@@ -139,12 +195,9 @@ def register(app: Client):
             await wait.edit("❌ No results found. Try a different search term.")
             return
 
-        # Store session
         sk = _key(f"{u.id}{query}")
         _sessions[sk] = {e["id"]: e for e in entries}
 
-        # ── Build result buttons (one per row, matches screenshot) ─────────────
-        # Header: "Search Results (YT Music):"
         buttons = [
             [InlineKeyboardButton(
                 (entry.get("title") or "Unknown")[:55],
@@ -160,7 +213,6 @@ def register(app: Client):
             reply_markup=InlineKeyboardMarkup(buttons),
         )
 
-    # ── Callback: user taps a song ─────────────────────────────────────────────
     @app.on_callback_query(filters.regex(r"^song"))
     async def song_callback(client: Client, query: CallbackQuery):
         await query.answer()
@@ -177,62 +229,45 @@ def register(app: Client):
         entry = _sessions.get(sk, {}).get(vid_id)
         if not entry:
             await query.message.reply(
-                "❌ Session expired. Search again with `/song`.",
-                parse_mode=MD,
+                "❌ Session expired. Search again with `/song`.", parse_mode=MD
             )
             return
 
-        title    = entry.get("title")    or "Unknown"
-        artist   = entry.get("uploader") or entry.get("channel") or "Unknown"
-        duration = int(entry.get("duration") or 0)
-        yt_url   = f"https://music.youtube.com/watch?v={vid_id}"
+        title     = entry.get("title")    or "Unknown"
+        artist    = entry.get("uploader") or entry.get("channel") or "Unknown"
+        duration  = int(entry.get("duration") or 0)
+        yt_url    = f"https://music.youtube.com/watch?v={vid_id}"
         thumb_url = (
             entry.get("thumbnail")
             or ((entry.get("thumbnails") or [{}])[-1].get("url"))
         )
 
-        # ── Status: Preparing ──────────────────────────────────────────────────
+        # Replace search results list with status message
         await query.message.edit("Preparing Your Song...")
 
-        # ── Fetch thumbnail ────────────────────────────────────────────────────
-        async def _fetch_thumb() -> bytes | None:
-            if not thumb_url:
-                return None
+        # Fetch thumbnail
+        thumb_data: bytes | None = None
+        if thumb_url:
             try:
                 async with httpx.AsyncClient(timeout=10) as hx:
                     r = await hx.get(thumb_url)
-                    return r.content if r.status_code == 200 else None
+                    if r.status_code == 200:
+                        thumb_data = r.content
             except Exception:
-                return None
-
-        thumb_data = await _fetch_thumb()
-
-        # ── Status: Downloading ────────────────────────────────────────────────
-        await query.message.edit("Downloading ...")
+                pass
 
         with tempfile.TemporaryDirectory() as tmp:
+            hook = await _make_progress_hook(query.message, title)
+
             ydl_opts = {
+                **_ydl_base(),
                 "format":         "bestaudio/best",
                 "outtmpl":        os.path.join(tmp, "%(id)s.%(ext)s"),
-                "quiet":          True,
-                "extractor_args": {"youtube": {"player_client": ["tv_embedded", "web"]}},
-                "http_headers":   {
-                    "User-Agent": (
-                        "Mozilla/5.0 (SMART-TV; Linux; Tizen 5.0) "
-                        "AppleWebKit/537.36 (KHTML, like Gecko) "
-                        "SamsungBrowser/2.1 Chrome/56.0.2924.0 TV Safari/537.36"
-                    )
-                },
+                "progress_hooks": [hook],
                 "postprocessors": [
-                    {
-                        "key":              "FFmpegExtractAudio",
-                        "preferredcodec":   "mp3",
-                        "preferredquality": "192",
-                    },
-                    {
-                        "key":          "FFmpegMetadata",
-                        "add_metadata": True,
-                    },
+                    {"key": "FFmpegExtractAudio",
+                     "preferredcodec": "mp3", "preferredquality": "192"},
+                    {"key": "FFmpegMetadata", "add_metadata": True},
                 ],
             }
 
@@ -246,7 +281,6 @@ def register(app: Client):
                 await query.message.edit(f"❌ Download failed:\n`{e}`", parse_mode=MD)
                 return
 
-            # Locate the mp3
             mp3 = os.path.join(tmp, f"{vid_id}.mp3")
             if not os.path.exists(mp3):
                 mp3 = _find_mp3(tmp)
@@ -254,8 +288,7 @@ def register(app: Client):
                 await query.message.edit("❌ Could not find downloaded audio file.")
                 return
 
-            # Embed album art via mutagen (in background thread)
-            if thumb_data and isinstance(thumb_data, bytes):
+            if thumb_data:
                 await asyncio.to_thread(_embed_art, mp3, thumb_data, title, artist)
 
             size_mb = os.path.getsize(mp3) / 1024 / 1024
@@ -265,35 +298,24 @@ def register(app: Client):
                 )
                 return
 
-            # Fresh BytesIO for Telegram thumbnail (mutagen must not share this)
             thumb_io = None
-            if thumb_data and isinstance(thumb_data, bytes):
+            if thumb_data:
                 thumb_io      = io.BytesIO(thumb_data)
                 thumb_io.name = "thumb.jpg"
 
-            # ── Status: Uploading ──────────────────────────────────────────────
             await query.message.edit("Uploading ...")
 
-            # ── Caption matching screenshot ────────────────────────────────────
-            # 🎵 Song   : Nocopyright
-            # 🎤 Artist  : Charlie Brown
-            # 📀 Source  : YT Music
-            song_name = entry.get("track") or title   # yt-dlp may parse track separately
+            song_name = entry.get("track") or title
             caption = (
                 f"🎵 **Song**   : {song_name}\n"
                 f"🎤 **Artist** : {artist}\n"
                 f"📀 **Source** : YT Music"
             )
 
-            # Delete the status message, then send audio
             await query.message.delete()
             await client.send_audio(
-                query.message.chat.id,
-                mp3,
-                caption=caption,
-                parse_mode=MD,
-                title=title,
-                performer=artist,
-                duration=duration,
-                thumb=thumb_io,
+                query.message.chat.id, mp3,
+                caption=caption, parse_mode=MD,
+                title=title, performer=artist,
+                duration=duration, thumb=thumb_io,
             )
