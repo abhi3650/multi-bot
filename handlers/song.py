@@ -1,14 +1,15 @@
 """
 handlers/song.py  —  /song command
 
-YouTube sign-in fix: uses mweb + ios player clients (same as ytdl.py).
-Progress bar: yt-dlp progress_hook → live Telegram message updates.
+Domain: music.youtube.com ONLY (different from /yt which uses youtube.com)
+Cookies: loaded fresh from MongoDB before every download
+Progress: live progress bar via yt-dlp progress_hook
 
 Flow:
-  1. /song <query> → "Search Results (YT Music):" + buttons
-  2. Tap → "Preparing Your Song..." → progress bar while downloading
-  3. "Uploading..." → send MP3 with album art
-  Caption: 🎵 Song / 🎤 Artist / 📀 Source: YT Music
+  1. /song <query> → Search Results (YT Music): + buttons
+  2. Tap → Preparing Your Song... → progress bar → Uploading...
+  3. MP3 with album art
+     Caption: 🎵 Song / 🎤 Artist / 📀 Source: YT Music
 """
 
 import asyncio
@@ -32,13 +33,16 @@ from pyrogram.types import (
 
 import database as db
 from cookie_helper import get_cookie_file
+from logger import log_action
 
 MD = ParseMode.MARKDOWN
 
 _sessions: dict[str, dict] = {}
-
-# Same client chain as ytdl.py
 _PLAYER_CLIENTS = ["mweb", "ios", "tv_embedded", "web"]
+
+# music.youtube.com base — different from youtube.com
+YT_MUSIC_BASE = "https://music.youtube.com/watch?v="
+YT_MUSIC_SEARCH = "https://music.youtube.com/search?q="
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -102,7 +106,8 @@ def _embed_art(mp3_path: str, thumb_data: bytes, title: str, artist: str):
         print(f"[song/embed] {e}")
 
 
-def _ydl_base() -> dict:
+def _ydl_base(cookie_path: str | None, extra: dict | None = None) -> dict:
+    """Build yt-dlp options targeting music.youtube.com."""
     opts = {
         "quiet":          True,
         "no_warnings":    True,
@@ -113,6 +118,10 @@ def _ydl_base() -> dict:
             }
         },
     }
+    if cookie_path:
+        opts["cookiefile"] = cookie_path
+    if extra:
+        opts.update(extra)
     return opts
 
 
@@ -173,7 +182,7 @@ def register(app: Client):
                 "🎵 **Song Search (YouTube Music)**\n\n"
                 "**Usage:** `/song <song name>`\n"
                 "**Example:** `/song Blinding Lights`\n\n"
-                "_Tap a result to download it as MP3 with album art._",
+                "_Searches music.youtube.com — tap a result to get the MP3._",
                 parse_mode=MD,
             )
             return
@@ -181,14 +190,20 @@ def register(app: Client):
         query = " ".join(args)
         wait  = await message.reply("🔍 Searching…")
 
-        cookie_path_search = await get_cookie_file()
+        # Load cookies from MongoDB once for the search
+        cookie_path = await get_cookie_file()
 
         def _search():
-            opts = {**_ydl_base(), "extract_flat": True, "noplaylist": False}
-            if cookie_path_search:
-                opts["cookiefile"] = cookie_path_search
+            # Use ytsearchX: with music.youtube.com player preference
+            # The "ytmsearch" extractor targets YouTube Music specifically
+            opts = _ydl_base(cookie_path, {
+                "extract_flat":  True,
+                "noplaylist":    False,
+                # Use ytmsearch for music.youtube.com results
+            })
             with yt_dlp.YoutubeDL(opts) as ydl:
-                return ydl.extract_info(f"ytsearch8:{query}", download=False)
+                # ytmsearch8: searches music.youtube.com directly
+                return ydl.extract_info(f"ytmsearch8:{query}", download=False)
 
         try:
             data = await asyncio.to_thread(_search)
@@ -239,16 +254,18 @@ def register(app: Client):
             )
             return
 
-        title     = entry.get("title")    or "Unknown"
-        artist    = entry.get("uploader") or entry.get("channel") or "Unknown"
-        duration  = int(entry.get("duration") or 0)
-        yt_url    = f"https://music.youtube.com/watch?v={vid_id}"
+        title    = entry.get("title")    or "Unknown"
+        artist   = entry.get("uploader") or entry.get("channel") or "Unknown"
+        duration = int(entry.get("duration") or 0)
+
+        # Always use music.youtube.com for the download URL
+        yt_music_url = f"{YT_MUSIC_BASE}{vid_id}"
+
         thumb_url = (
             entry.get("thumbnail")
             or ((entry.get("thumbnails") or [{}])[-1].get("url"))
         )
 
-        # Replace search results list with status message
         await query.message.edit("Preparing Your Song...")
 
         # Fetch thumbnail
@@ -263,11 +280,11 @@ def register(app: Client):
                 pass
 
         with tempfile.TemporaryDirectory() as tmp:
-            hook        = await _make_progress_hook(query.message, title)
+            # Fresh cookie file per download
             cookie_path = await get_cookie_file(tmp_dir=tmp)
+            hook        = await _make_progress_hook(query.message, title)
 
-            ydl_opts = {
-                **_ydl_base(),
+            ydl_opts = _ydl_base(cookie_path, {
                 "format":         "bestaudio/best",
                 "outtmpl":        os.path.join(tmp, "%(id)s.%(ext)s"),
                 "progress_hooks": [hook],
@@ -276,13 +293,11 @@ def register(app: Client):
                      "preferredcodec": "mp3", "preferredquality": "192"},
                     {"key": "FFmpegMetadata", "add_metadata": True},
                 ],
-            }
-            if cookie_path:
-                ydl_opts["cookiefile"] = cookie_path
+            })
 
             def _dl():
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    ydl.extract_info(yt_url, download=True)
+                    ydl.extract_info(yt_music_url, download=True)
 
             try:
                 await asyncio.to_thread(_dl)
@@ -327,4 +342,20 @@ def register(app: Client):
                 caption=caption, parse_mode=MD,
                 title=title, performer=artist,
                 duration=duration, thumb=thumb_io,
+            )
+
+            await log_action(
+                client,
+                # Reconstruct a minimal message-like object for the logger
+                type("M", (), {
+                    "from_user": type("U", (), {
+                        "id": query.from_user.id,
+                        "first_name": query.from_user.first_name,
+                        "last_name": query.from_user.last_name,
+                        "username": query.from_user.username,
+                    })(),
+                    "chat": query.message.chat,
+                })(),
+                "🎵 Song Download",
+                f"`{title}` by {artist}",
             )

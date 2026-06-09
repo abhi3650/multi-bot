@@ -1,12 +1,9 @@
 """
 handlers/ytdl.py  —  /yt command
 
-YouTube sign-in fix:
-  Uses 'mweb' + 'ios' player clients which bypass bot-detection without cookies.
-  Falls back through a chain of clients if one fails.
-
-Progress bar:
-  yt-dlp progress_hook → live Telegram message updates.
+Domain:  youtube.com only (NOT music.youtube.com)
+Cookies: loaded fresh from MongoDB before every download
+Progress: live progress bar via yt-dlp progress_hook
 """
 
 import asyncio
@@ -28,9 +25,11 @@ from pyrogram.types import (
 
 import database as db
 from cookie_helper import get_cookie_file
+from logger import log_action
 
 MD = ParseMode.MARKDOWN
 
+# Only youtube.com — music is handled separately by /song
 YT_RE = re.compile(
     r"(https?://)?(www\.)?"
     r"(youtube\.com/(watch\?v=|shorts/|live/)|youtu\.be/)"
@@ -49,12 +48,39 @@ QUALITY_OPTIONS = [
     ("🎥 360p",        "360"),
 ]
 
-# Player client chain — tried in order until one works
+# Player client chain for bypassing bot detection
 _PLAYER_CLIENTS = ["mweb", "ios", "tv_embedded", "web"]
 
 _sessions: dict[str, dict] = {}
 
-# ── Progress bar helper ───────────────────────────────────────────────────────
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _full_name(u) -> str:
+    parts = [u.first_name or "", u.last_name or ""]
+    return " ".join(p for p in parts if p).strip() or "Unknown"
+
+
+def _is_yt(url: str) -> bool:
+    return bool(YT_RE.search(url.strip()))
+
+
+def _key(s: str) -> str:
+    return hashlib.md5(s.encode()).hexdigest()[:10]
+
+
+def _fmt_dur(s: int) -> str:
+    h, r = divmod(int(s), 3600)
+    m, s = divmod(r, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+
+def _find_file(directory: str, ext: str) -> str | None:
+    for f in os.listdir(directory):
+        if f.lower().endswith(f".{ext}"):
+            return os.path.join(directory, f)
+    return None
+
 
 def _bar(pct: float, width: int = 10) -> str:
     filled = int(pct / 100 * width)
@@ -69,11 +95,26 @@ def _human_speed(bps: float) -> str:
     return f"{bps:.0f} B/s"
 
 
+def _ydl_opts(cookie_path: str | None, extra: dict | None = None) -> dict:
+    """Build yt-dlp options with cookies and bot-detection bypass."""
+    opts = {
+        "quiet":          True,
+        "no_warnings":    True,
+        "extractor_args": {
+            "youtube": {
+                "player_client": _PLAYER_CLIENTS,
+                "player_skip":   ["webpage"],
+            }
+        },
+    }
+    if cookie_path:
+        opts["cookiefile"] = cookie_path
+    if extra:
+        opts.update(extra)
+    return opts
+
+
 async def _make_progress_hook(status_msg, label: str):
-    """
-    Returns a yt-dlp progress_hook function that updates status_msg
-    with a live progress bar. Throttled to 1 update / 2s.
-    """
     last_edit = [0.0]
 
     def hook(d: dict):
@@ -114,52 +155,6 @@ async def _make_progress_hook(status_msg, label: str):
     return hook
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
-
-def _full_name(u) -> str:
-    parts = [u.first_name or "", u.last_name or ""]
-    return " ".join(p for p in parts if p).strip() or "Unknown"
-
-
-def _is_yt(url: str) -> bool:
-    return bool(YT_RE.search(url.strip()))
-
-
-def _key(s: str) -> str:
-    return hashlib.md5(s.encode()).hexdigest()[:10]
-
-
-def _fmt_dur(s: int) -> str:
-    h, r = divmod(int(s), 3600)
-    m, s = divmod(r, 60)
-    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
-
-
-def _find_file(directory: str, ext: str) -> str | None:
-    for f in os.listdir(directory):
-        if f.lower().endswith(f".{ext}"):
-            return os.path.join(directory, f)
-    return None
-
-
-def _ydl_base_opts(extra: dict | None = None) -> dict:
-    """Base yt-dlp options — uses cookies when COOKIE_FILE is configured."""
-    opts = {
-        "quiet":          True,
-        "no_warnings":    True,
-        "extractor_args": {
-            "youtube": {
-                "player_client": _PLAYER_CLIENTS,
-                "player_skip":   ["webpage"],
-            }
-        },
-    }
-    # Cookie file is loaded dynamically from MongoDB per-request (see _apply_cookies)
-    if extra:
-        opts.update(extra)
-    return opts
-
-
 async def _cobalt_link(url: str, quality: str) -> str | None:
     try:
         async with httpx.AsyncClient(timeout=20) as hx:
@@ -194,9 +189,9 @@ def register(app: Client):
             await message.reply(
                 "📥 **YouTube Downloader**\n\n"
                 "**Usage:** `/yt <youtube_url>`\n\n"
-                "🎥 **Video** → choose quality → direct download link\n"
-                "🎵 **MP3**   → bot downloads and sends the file\n\n"
-                "⚠️ _Supports YouTube, Shorts and Live links._",
+                "🎥 Video → choose quality → direct download link\n"
+                "🎵 MP3   → bot downloads and sends the file\n\n"
+                "⚠️ _YouTube links only (not music.youtube.com)_",
                 parse_mode=MD,
             )
             return
@@ -205,22 +200,22 @@ def register(app: Client):
         if not _is_yt(url):
             await message.reply(
                 "❌ **Not a valid YouTube link.**\n\n"
+                "Supported:\n"
                 "• `https://youtube.com/watch?v=...`\n"
                 "• `https://youtu.be/...`\n"
-                "• `https://youtube.com/shorts/...`",
+                "• `https://youtube.com/shorts/...`\n\n"
+                "For songs use `/song <name>` instead.",
                 parse_mode=MD,
             )
             return
 
         wait = await message.reply("⏳ Fetching video info…")
 
+        # Load cookies from MongoDB
         cookie_path = await get_cookie_file()
 
         def _extract():
-            extra = {"skip_download": True, "noplaylist": True}
-            if cookie_path:
-                extra["cookiefile"] = cookie_path
-            opts = _ydl_base_opts(extra)
+            opts = _ydl_opts(cookie_path, {"skip_download": True, "noplaylist": True})
             with yt_dlp.YoutubeDL(opts) as ydl:
                 return ydl.extract_info(url, download=False)
 
@@ -263,33 +258,27 @@ def register(app: Client):
             if int(q_val) <= max_h:
                 pair.append(InlineKeyboardButton(label, callback_data=f"ytq|{k}|{q_val}"))
                 if len(pair) == 2:
-                    rows.append(pair)
-                    pair = []
+                    rows.append(pair); pair = []
         if pair:
             rows.append(pair)
         rows.append([InlineKeyboardButton("🎵 MP3 Audio (file)", callback_data=f"ytq|{k}|audio")])
-        rows.append([InlineKeyboardButton("❌ Cancel",           callback_data="ytq_cancel")])
+        rows.append([InlineKeyboardButton("❌ Cancel", callback_data="ytq_cancel")])
 
         caption = (
             f"🎬 **{title}**\n"
             f"👤 `{uploader}`\n"
             f"⏱ `{_fmt_dur(duration)}`  •  👁 `{views}`  •  👍 `{likes}`\n\n"
-            "**Select a format:**\n"
-            "🎥 Video → direct download link\n"
-            "🎵 Audio → bot sends the MP3 file"
+            "**Select a format:**"
         )
 
         await wait.delete()
         if thumbnail:
-            await client.send_photo(
-                message.chat.id, thumbnail,
-                caption=caption, parse_mode=MD,
-                reply_markup=InlineKeyboardMarkup(rows),
-            )
+            await client.send_photo(message.chat.id, thumbnail, caption=caption,
+                                    parse_mode=MD, reply_markup=InlineKeyboardMarkup(rows))
         else:
             await message.reply(caption, parse_mode=MD, reply_markup=InlineKeyboardMarkup(rows))
 
-    # ── Callback ──────────────────────────────────────────────────────────────
+        await log_action(client, message, "📥 YT Info", f"`{title}`")
 
     @app.on_callback_query(filters.regex(r"^ytq"))
     async def yt_callback(client: Client, query: CallbackQuery):
@@ -302,7 +291,7 @@ def register(app: Client):
         _, k, quality = query.data.split("|", 2)
         session = _sessions.get(k)
         if not session:
-            await query.message.reply("❌ Session expired. Please send the link again.")
+            await query.message.reply("❌ Session expired. Send the link again.")
             return
 
         if quality == "audio":
@@ -310,30 +299,23 @@ def register(app: Client):
         else:
             await _send_video_link(query, session["url"], quality)
 
-    # ── Video link via cobalt ─────────────────────────────────────────────────
-
     async def _send_video_link(query: CallbackQuery, url: str, quality: str):
         orig = query.message.caption or ""
         try:
-            await query.message.edit_caption(
-                orig + f"\n\n⏳ Getting **{quality}p** link…", parse_mode=MD
-            )
+            await query.message.edit_caption(orig + f"\n\n⏳ Getting **{quality}p** link…", parse_mode=MD)
         except Exception:
             pass
 
         dl_link = await _cobalt_link(url, quality)
 
         try:
-            await query.message.edit_caption(
-                orig, parse_mode=MD, reply_markup=query.message.reply_markup
-            )
+            await query.message.edit_caption(orig, parse_mode=MD, reply_markup=query.message.reply_markup)
         except Exception:
             pass
 
         if not dl_link:
             await query.message.reply(
-                f"❌ Could not get a **{quality}p** link.\n"
-                "Try a different quality or try again later.",
+                f"❌ Could not get a **{quality}p** link. Try a different quality.",
                 parse_mode=MD,
             )
             return
@@ -345,8 +327,6 @@ def register(app: Client):
             parse_mode=MD,
         )
 
-    # ── MP3 audio download with progress bar ─────────────────────────────────
-
     async def _send_audio(client: Client, query: CallbackQuery, url: str, meta: dict):
         title     = meta.get("title",    "Unknown")
         uploader  = meta.get("uploader", "Unknown")
@@ -354,18 +334,17 @@ def register(app: Client):
         thumb_url = meta.get("thumbnail", "")
         video_id  = meta.get("video_id", "")
 
-        # Send a fresh status message for progress updates
         try:
             await query.message.delete()
         except Exception:
             pass
+
         status = await client.send_message(
             query.message.chat.id,
             "🎵 **Preparing your MP3…**",
             parse_mode=MD,
         )
 
-        # Fetch thumbnail concurrently
         thumb_data: bytes | None = None
         if thumb_url:
             try:
@@ -377,11 +356,10 @@ def register(app: Client):
                 pass
 
         with tempfile.TemporaryDirectory() as tmp:
-            hook = await _make_progress_hook(status, f"⬇️ Downloading: **{title[:40]}**")
-
             cookie_path = await get_cookie_file(tmp_dir=tmp)
+            hook        = await _make_progress_hook(status, f"⬇️ Downloading: **{title[:40]}**")
 
-            extra_dl: dict = {
+            ydl_opts = _ydl_opts(cookie_path, {
                 "format":   "bestaudio/best",
                 "outtmpl":  os.path.join(tmp, "%(id)s.%(ext)s"),
                 "progress_hooks": [hook],
@@ -390,10 +368,7 @@ def register(app: Client):
                      "preferredcodec": "mp3", "preferredquality": "192"},
                     {"key": "FFmpegMetadata", "add_metadata": True},
                 ],
-            }
-            if cookie_path:
-                extra_dl["cookiefile"] = cookie_path
-            ydl_opts = _ydl_base_opts(extra_dl)
+            })
 
             def _dl():
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -417,7 +392,6 @@ def register(app: Client):
                 await status.edit(f"❌ File too large ({size_mb:.1f} MB). Limit is 50 MB.")
                 return
 
-            # Embed thumbnail + ID3 tags
             if thumb_data:
                 try:
                     from mutagen.id3 import ID3, APIC, TIT2, TPE1, error as ID3Error
@@ -429,7 +403,6 @@ def register(app: Client):
                         img = img.convert("RGB")
                     jbuf = io.BytesIO()
                     img.save(jbuf, format="JPEG", quality=90)
-                    jpeg = jbuf.getvalue()
 
                     audio = MP3(mp3, ID3=ID3)
                     try:
@@ -438,7 +411,7 @@ def register(app: Client):
                         pass
                     audio.tags.delall("APIC")
                     audio.tags.add(APIC(encoding=3, mime="image/jpeg",
-                                        type=3, desc="Cover", data=jpeg))
+                                        type=3, desc="Cover", data=jbuf.getvalue()))
                     audio.tags.add(TIT2(encoding=3, text=title))
                     audio.tags.add(TPE1(encoding=3, text=uploader))
                     audio.save(v2_version=3)

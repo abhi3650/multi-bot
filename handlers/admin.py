@@ -326,11 +326,24 @@ def register(app: Client):
         )
         size_kb = len(content.encode()) / 1024
 
-        await wait.edit(
+        # Delete the wait message and the uploaded file message for clean chat
+        import asyncio as _asyncio
+        await wait.delete()
+        try:
+            await message.delete()
+        except Exception:
+            pass
+
+        # Send confirmation that auto-deletes after 10 seconds
+        confirm = await message.reply(
             "✅ **YouTube cookies uploaded successfully!**\n\n"
             f"🍪 Cookies : `{cookie_count}` entries\n"
             f"📦 Size    : `{size_kb:.1f} KB`\n\n"
-            "_All future `/yt` and `/song` downloads will use these cookies.\n"
-            "Use `/cook delete` to remove them._",
+            "_This message will be deleted in 10 seconds._",
             parse_mode=MD,
         )
+        await _asyncio.sleep(10)
+        try:
+            await confirm.delete()
+        except Exception:
+            pass
