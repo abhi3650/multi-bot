@@ -38,7 +38,7 @@ from logger import log_action
 MD = ParseMode.MARKDOWN
 
 _sessions: dict[str, dict] = {}
-_PLAYER_CLIENTS = ["mweb", "ios", "tv_embedded", "web"]
+_PLAYER_CLIENTS = ["tv_embedded", "mweb", "web"]
 
 # music.youtube.com base — different from youtube.com
 YT_MUSIC_BASE = "https://music.youtube.com/watch?v="
@@ -107,13 +107,18 @@ def _embed_art(mp3_path: str, thumb_data: bytes, title: str, artist: str):
 
 
 def _ydl_base(cookie_path: str | None, extra: dict | None = None) -> dict:
-    """Build yt-dlp options targeting music.youtube.com."""
+    """
+    Build yt-dlp options for music.youtube.com.
+    With cookies: 'web' client (authenticated).
+    Without cookies: 'tv_embedded' (bypasses bot check for most tracks).
+    """
+    client = ["web"] if cookie_path else ["tv_embedded", "mweb"]
     opts = {
         "quiet":          True,
         "no_warnings":    True,
         "extractor_args": {
             "youtube": {
-                "player_client": _PLAYER_CLIENTS,
+                "player_client": client,
                 "player_skip":   ["webpage"],
             }
         },
@@ -194,16 +199,16 @@ def register(app: Client):
         cookie_path = await get_cookie_file()
 
         def _search():
-            # Use ytsearchX: with music.youtube.com player preference
-            # The "ytmsearch" extractor targets YouTube Music specifically
             opts = _ydl_base(cookie_path, {
-                "extract_flat":  True,
-                "noplaylist":    False,
-                # Use ytmsearch for music.youtube.com results
+                "extract_flat":      True,
+                "noplaylist":        False,
+                "default_search":    "ytsearch",
+                # Prefer music.youtube.com results by querying with site filter
             })
             with yt_dlp.YoutubeDL(opts) as ydl:
-                # ytmsearch8: searches music.youtube.com directly
-                return ydl.extract_info(f"ytmsearch8:{query}", download=False)
+                # Search YouTube Music by using site:music.youtube.com trick
+                # ytsearch8 is universally supported; we then use music.youtube.com URL for download
+                return ydl.extract_info(f"ytsearch8:{query} site:music.youtube.com", download=False)
 
         try:
             data = await asyncio.to_thread(_search)

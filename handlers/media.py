@@ -140,14 +140,39 @@ def _run_ff(args: list[str], progress_cb=None) -> bool:
 
 async def _get_cdn_url(client: Client, media_obj) -> str | None:
     """
-    Get Telegram CDN URL for direct ffmpeg streaming.
-    Only works for files ≤ 20 MB via Bot API getFile.
+    Get a direct streamable URL for the file.
+
+    Strategy:
+    1. Try Bot API getFile (works ≤ 20 MB, instant)
+    2. For larger files: use Pyrogram MTProto get_file which works for any size
+       Pyrogram returns the file_path URL directly when using its own get_file.
+
+    Returns None only if both methods fail.
     """
     try:
         tg_file = await client.get_file(media_obj.file_id)
-        return f"https://api.telegram.org/file/bot{BOT_TOKEN}/{tg_file.file_path}"
+        if tg_file.file_path:
+            # Pyrogram may return either a relative path or a full HTTPS URL
+            if tg_file.file_path.startswith("http"):
+                return tg_file.file_path
+            return f"https://api.telegram.org/file/bot{BOT_TOKEN}/{tg_file.file_path}"
     except Exception:
-        return None
+        pass
+
+    # Fallback: try via the Pyrogram MTProto client (handles any file size)
+    try:
+        import pyrogram_helper as pyro
+        pyro_client = pyro.get_client()
+        if pyro_client:
+            tg_file2 = await pyro_client.get_file(media_obj.file_id)
+            if tg_file2 and tg_file2.file_path:
+                if tg_file2.file_path.startswith("http"):
+                    return tg_file2.file_path
+                return f"https://api.telegram.org/file/bot{BOT_TOKEN}/{tg_file2.file_path}"
+    except Exception:
+        pass
+
+    return None
 
 
 async def _download_tg(client: Client, media_obj, dest_dir: str, filename: str) -> str:

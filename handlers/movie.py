@@ -7,7 +7,7 @@ handlers/movie.py  —  /imdb  /ott  /posters
   Detail: GET /offers/object_type/{type}/id_type/tmdb/locale/en_IN?id=<tmdb_id>&token=<TOKEN>
 
   No GraphQL. No TMDB fallback for OTT. No env var check inside handlers.
-  If JUSTWATCH_TOKEN is empty the command still works — it uses TMDB for
+  If  is empty the command still works — it uses TMDB for
   the search result picker but shows a "token not configured" notice for offers.
 
 /posters UI: type picker → paginated browsing with <<  <  N/T  >  >>  Back  Close
@@ -25,23 +25,12 @@ from pyrogram.types import (
 )
 
 import database as db
-from config import TMDB_API_KEY, TMDB_BASE, TMDB_IMG, JUSTWATCH_TOKEN, BOT_USERNAME
+from config import TMDB_API_KEY, TMDB_BASE, TMDB_IMG, BOT_USERNAME
+import justwatch as jw
 from logger import log_action
 
 MD  = ParseMode.MARKDOWN
 log = logging.getLogger(__name__)
-
-# JustWatch Content Partner API v2
-JW_BASE   = "https://apis.justwatch.com/contentpartner/v2/content"
-JW_LOCALE = "en_IN"   # India locale
-
-_OTT_LABELS = {
-    "flatrate": ("✅", "Subscription"),
-    "free":     ("🆓", "Free"),
-    "ads":      ("📢", "With Ads"),
-    "buy":      ("🛒", "Buy"),
-    "rent":     ("💰", "Rent"),
-}
 
 # Session stores
 _ott_sessions:    dict[str, list] = {}
@@ -77,54 +66,6 @@ async def _tmdb_detail(mtype: str, tmdb_id: int, hx: httpx.AsyncClient) -> dict:
 
 
 # ── JustWatch Content Partner API v2 ─────────────────────────────────────────
-
-async def _jw_search_titles(hx: httpx.AsyncClient, query: str) -> list[dict]:
-    """
-    Search JustWatch for titles matching query.
-    Returns list of title items (each has title, year, object_type, justwatch_id, offers, full_path).
-    """
-    if not JUSTWATCH_TOKEN:
-        return []
-    try:
-        r = await hx.get(
-            f"{JW_BASE}/titles/object_type/all/locale/{JW_LOCALE}",
-            params={"query": query, "token": JUSTWATCH_TOKEN},
-            timeout=15,
-        )
-        if r.status_code != 200:
-            log.warning("[jw/search] HTTP %s for %r", r.status_code, query)
-            return []
-        return r.json().get("items", [])
-    except Exception as exc:
-        log.warning("[jw/search] %s", exc)
-        return []
-
-
-async def _jw_offers_by_tmdb(
-    hx: httpx.AsyncClient,
-    object_type: str,   # "movie" or "show"
-    tmdb_id: int,
-) -> dict | None:
-    """
-    Fetch offers for a specific title using TMDB ID.
-    Returns the full response dict (title, offers, full_path, etc.) or None.
-    """
-    if not JUSTWATCH_TOKEN:
-        return None
-    try:
-        r = await hx.get(
-            f"{JW_BASE}/offers/object_type/{object_type}/id_type/tmdb/locale/{JW_LOCALE}",
-            params={"id": tmdb_id, "token": JUSTWATCH_TOKEN},
-            timeout=15,
-        )
-        if r.status_code != 200:
-            log.warning("[jw/offers] HTTP %s for tmdb=%s", r.status_code, tmdb_id)
-            return None
-        return r.json()
-    except Exception as exc:
-        log.warning("[jw/offers] %s", exc)
-        return None
-
 
 def _build_providers(offers: list) -> dict[str, list[str]]:
     """Group offers by monetization_type → list of provider names."""
@@ -225,11 +166,7 @@ def register(app: Client):
 
         await log_action(client, message, "🎬 IMDB Lookup", f"`{title}` ({year})")
 
-    @app.on_callback_query(filters.regex(r"^imdb_ott\|"))
-    async def imdb_ott_cb(client: Client, query: CallbackQuery):
-        await query.answer("🔍 Fetching OTT data…")
-        _, mtype, tmdb_id_str, title = query.data.split("|", 3)
-        await _fetch_and_send_ott(client, query.message, mtype, int(tmdb_id_str), title, reply=True)
+
 
     # ── /ott ──────────────────────────────────────────────────────────────────
 
@@ -251,39 +188,22 @@ def register(app: Client):
         query = " ".join(args)
         wait  = await message.reply(f"🔍 Searching **{query}**…", parse_mode=MD)
 
-        async with httpx.AsyncClient(timeout=20) as hx:
-            # Step 1: use JustWatch search to get candidates
-            items = await _jw_search_titles(hx, query)
+        # Use free JustWatch public API (no token needed)
+        items = await jw.search_all(query, page_size=8)
 
         if not items:
-            # JustWatch returned nothing (or token not configured)
-            # Fall back to TMDB search just for the title/year picker
-            async with httpx.AsyncClient(timeout=15) as hx:
-                hit = await _tmdb_search(query, hx)
-            if not hit:
-                await wait.edit(f"❌ No results found for **{query}**.", parse_mode=MD)
-                return
-            # Go directly to detail using TMDB ID
-            mtype   = hit["media_type"]
-            tmdb_id = hit["id"]
-            title   = hit.get("title") or hit.get("name") or query
-            await wait.delete()
-            await _fetch_and_send_ott(client, message, mtype, tmdb_id, title, reply=True)
-            await log_action(client, message, "📺 OTT Lookup", f"`{title}`")
+            await wait.edit(f"❌ No results found for **{query}** on JustWatch.", parse_mode=MD)
             return
 
         if len(items) == 1:
-            # Only one result — resolve TMDB ID and go straight to detail
-            item    = items[0]
-            tmdb_id = item.get("tmdb_id") or item.get("imdb_id") or 0
-            otype   = item.get("object_type", "movie")
-            title   = item.get("title", query)
+            item  = items[0]
+            title = item.get("title", query)
             await wait.delete()
-            await _fetch_and_send_ott(client, message, otype, tmdb_id, title, reply=True, jw_item=item)
+            await _send_ott_detail(client, message, item, title, reply=True)
             await log_action(client, message, "📺 OTT Lookup", f"`{title}`")
             return
 
-        # Multiple results → show picker
+        # Multiple results — show picker
         sk = _sk(query)
         _ott_sessions[sk] = items
 
@@ -309,86 +229,73 @@ def register(app: Client):
         if not items:
             await query.answer("Session expired. Search again.", show_alert=True)
             return
-        item    = items[int(idx_str)]
-        tmdb_id = item.get("tmdb_id") or 0
-        otype   = item.get("object_type", "movie")
-        title   = item.get("title", "Unknown")
+        item  = items[int(idx_str)]
+        title = item.get("title", "Unknown")
         await query.message.delete()
-        await _fetch_and_send_ott(client, query.message, otype, tmdb_id, title, reply=True, jw_item=item)
+        await _send_ott_detail(client, query.message, item, title, reply=True)
 
     @app.on_callback_query(filters.regex(r"^ott_close$"))
     async def ott_close_cb(client: Client, query: CallbackQuery):
         await query.answer()
         await query.message.delete()
 
-    async def _fetch_and_send_ott(
+    # Also handle "Check OTT" button from /imdb
+    @app.on_callback_query(filters.regex(r"^imdb_ott\|"))
+    async def imdb_ott_cb(client: Client, query: CallbackQuery):
+        await query.answer("🔍 Searching JustWatch…")
+        title = query.data.split("|", 1)[1]
+        items = await jw.search_all(title, page_size=3)
+        item  = items[0] if items else None
+        await _send_ott_detail(client, query.message, item, title, reply=True)
+
+    async def _send_ott_detail(
         client, target: Message,
-        mtype: str, tmdb_id: int, title: str,
-        reply: bool,
-        jw_item: dict | None = None,
+        item: dict | None, query_title: str, reply: bool,
     ):
-        """
-        Fetch offers from JustWatch Content Partner API and format the result.
-        jw_item: pre-fetched JustWatch search result (has offers embedded).
-        """
-        offers   = []
-        full_path = ""
+        """Format and send OTT availability from a JustWatch item dict."""
+        if not item:
+            text = (
+                f"≡ **{query_title}**\n\n"
+                f"🔥 **Availability :-**\n"
+                f"_Not available for streaming in India yet._\n\n"
+                f"CC ~ @{BOT_USERNAME}"
+            )
+            jw_url = f"https://www.justwatch.com/in/search?q={query_title.replace(' ', '+')}"
+            kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔍 JustWatch", url=jw_url)]])
+            await (target.reply(text, parse_mode=MD, reply_markup=kb) if reply
+                   else target.edit(text, parse_mode=MD, reply_markup=kb))
+            return
 
-        if jw_item and jw_item.get("offers") is not None:
-            # Offers already embedded in the search result
-            offers    = jw_item.get("offers") or []
-            full_path = jw_item.get("full_path", "")
-            year      = jw_item.get("original_release_year", "")
-        else:
-            # Fetch separately using TMDB ID
-            if JUSTWATCH_TOKEN and tmdb_id:
-                async with httpx.AsyncClient(timeout=15) as hx:
-                    data = await _jw_offers_by_tmdb(hx, mtype, tmdb_id)
-                if data:
-                    offers    = data.get("offers") or []
-                    full_path = data.get("full_path", "")
-                    year      = data.get("original_release_year", "")
-                else:
-                    year = ""
-            else:
-                year = ""
+        title     = item.get("title", query_title)
+        year      = item.get("original_release_year", "")
+        offers    = item.get("offers") or []
+        jw_id     = item.get("id")
+        obj_type  = item.get("object_type", "movie")
 
-        providers = _build_providers(offers)
+        # If no offers in search result, fetch full detail
+        if not offers and jw_id:
+            detail = await jw.get_title(jw_id, obj_type)
+            if detail:
+                offers = detail.get("offers") or []
 
-        # Build JustWatch page URL
-        if full_path:
-            jw_url = f"https://www.justwatch.com{full_path}"
-        else:
-            jw_url = f"https://www.justwatch.com/in/search?q={title.replace(' ', '+')}"
+        avail_str = await jw.format_offers(offers)
 
-        # Format the message
         year_str   = f" ({year})" if year else ""
         title_line = f"≡ **{title}**{year_str}"
-        avail_line = "🔥 **Availability :-**\n"
+        text       = (
+            f"{title_line}\n\n"
+            f"🔥 **Availability :-**\n"
+            f"{avail_str}\n\n"
+            f"CC ~ @{BOT_USERNAME}"
+        )
 
-        if not JUSTWATCH_TOKEN:
-            avail_line += "_⚠️ JustWatch token not configured — add `JUSTWATCH_TOKEN` to `.env`_"
-        elif providers:
-            # Show subscription first, then free, then ads, then buy/rent
-            for key in ("flatrate", "free", "ads", "buy", "rent"):
-                names = providers.get(key, [])
-                if names:
-                    emoji, label = _OTT_LABELS[key]
-                    avail_line += f"{emoji} **{label}:** {', '.join(names)}\n"
-        else:
-            avail_line += "_Not available for streaming in India yet._"
-
-        credit = f"\nCC ~ @{BOT_USERNAME}"
-        text   = f"{title_line}\n\n{avail_line}{credit}"
-
-        keyboard = InlineKeyboardMarkup([[
-            InlineKeyboardButton("🔍 JustWatch", url=jw_url)
-        ]])
+        jw_url = f"https://www.justwatch.com/in/search?q={title.replace(' ', '+')}"
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔍 JustWatch", url=jw_url)]])
 
         if reply:
-            await target.reply(text, parse_mode=MD, reply_markup=keyboard)
+            await target.reply(text, parse_mode=MD, reply_markup=kb)
         else:
-            await target.edit(text, parse_mode=MD, reply_markup=keyboard)
+            await target.edit(text, parse_mode=MD, reply_markup=kb)
 
     # ── /posters ──────────────────────────────────────────────────────────────
 

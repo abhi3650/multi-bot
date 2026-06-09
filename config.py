@@ -8,9 +8,6 @@ API_ID          = int(os.getenv("API_ID", "0") or "0")
 API_HASH        = os.getenv("API_HASH", "")
 TMDB_API_KEY    = os.getenv("TMDB_API_KEY", "")
 
-# JustWatch Content Partner API token (from your contract with JustWatch)
-# Endpoint: https://apis.justwatch.com/contentpartner/v2/content/...?token=TOKEN
-JUSTWATCH_TOKEN = os.getenv("JUSTWATCH_TOKEN", "")
 
 STREAM_BASE_URL = os.getenv("STREAM_BASE_URL", "").rstrip("/")
 STREAM_PORT     = int(os.getenv("STREAM_PORT", "8080"))
@@ -22,11 +19,26 @@ BOT_USERNAME    = os.getenv("BOT_USERNAME", "YourBot").lstrip("@")
 MONGO_URI       = os.getenv("MONGO_URI", "mongodb://localhost:27017")
 MONGO_DB        = os.getenv("MONGO_DB",  "multipurpose_bot")
 
-# Channels (use integer IDs like -1001234567890)
-# LOG_CHANNEL  — all bot activity is sent here with user info
-# DUMP_CHANNEL — files are stored here for permanent /link generation
-LOG_CHANNEL     = int(os.getenv("LOG_CHANNEL",  "0") or "0")
-DUMP_CHANNEL    = int(os.getenv("DUMP_CHANNEL", "0") or "0")
+# Channels — use integer IDs: -1001234567890
+# The bot must be ADMIN in both channels.
+# LOG_CHANNEL  — all bot activity is logged here
+# DUMP_CHANNEL — files forwarded here for permanent /link storage
+def _chan(val: str) -> int:
+    """Parse a channel ID env var safely. Handles missing -100 prefix."""
+    val = (val or "").strip()
+    if not val or val == "0":
+        return 0
+    try:
+        n = int(val)
+        # Koyeb sometimes strips the minus — restore it for supergroups/channels
+        if n > 0 and n > 1_000_000_000:
+            n = -int(f"100{n}")
+        return n
+    except ValueError:
+        return 0
+
+LOG_CHANNEL     = _chan(os.getenv("LOG_CHANNEL",  "0"))
+DUMP_CHANNEL    = _chan(os.getenv("DUMP_CHANNEL", "0"))
 
 # Premium / billing
 PREMIUM_PRICE   = os.getenv("PREMIUM_PRICE", "35")

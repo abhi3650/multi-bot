@@ -123,7 +123,10 @@ def register(app: Client):
     @app.on_message(filters.command("stats") & admin_only & filters.private)
     async def cmd_stats(client: Client, message: Message):
         all_ids = await db.get_all_users()
-        prem    = sum(1 for uid in all_ids if await db.is_premium(uid))
+        prem    = 0
+        for uid in all_ids:
+            if await db.is_premium(uid):
+                prem += 1
         free    = len(all_ids) - prem
         meta    = await db.get_cookies_meta()
         cookie_status = "✅ Loaded" if meta else "❌ Not uploaded"

@@ -48,8 +48,8 @@ QUALITY_OPTIONS = [
     ("🎥 360p",        "360"),
 ]
 
-# Player client chain for bypassing bot detection
-_PLAYER_CLIENTS = ["mweb", "ios", "tv_embedded", "web"]
+# Player client chain — tv_embedded and mweb bypass most bot detection
+_PLAYER_CLIENTS = ["tv_embedded", "mweb", "web"]
 
 _sessions: dict[str, dict] = {}
 
@@ -96,13 +96,20 @@ def _human_speed(bps: float) -> str:
 
 
 def _ydl_opts(cookie_path: str | None, extra: dict | None = None) -> dict:
-    """Build yt-dlp options with cookies and bot-detection bypass."""
+    """
+    Build yt-dlp options with bot-detection bypass.
+    With cookies: use 'web' client (authenticated, most reliable).
+    Without cookies: use 'tv_embedded' (no sign-in needed for most content).
+    """
+    # With valid cookies the web client is most reliable
+    # Without cookies tv_embedded bypasses bot checks for most content
+    client = ["web"] if cookie_path else ["tv_embedded", "mweb"]
     opts = {
         "quiet":          True,
         "no_warnings":    True,
         "extractor_args": {
             "youtube": {
-                "player_client": _PLAYER_CLIENTS,
+                "player_client": client,
                 "player_skip":   ["webpage"],
             }
         },
