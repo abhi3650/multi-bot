@@ -157,3 +157,6 @@ async def format_offers(offers: list, locale: str = _LOCALE) -> str:
             lines.append(f"{emoji} **{label}:** {', '.join(names)}")
 
     return "\n".join(lines) if lines else "_Not available on any streaming platform yet._"
+
+# Alias — search_all is the same as search (kept for backward compatibility)
+search_all = search

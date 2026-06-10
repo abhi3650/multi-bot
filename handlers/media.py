@@ -35,7 +35,7 @@ from logger import log_action
 
 MD               = ParseMode.MARKDOWN
 SCREENSHOT_COUNT = 10
-_PLAYER_CLIENTS  = ["mweb", "ios", "tv_embedded", "web"]
+# player_client is chosen dynamically based on cookie presence (see _ydl_stream_url)
 
 
 # ── ffmpeg binary resolution ──────────────────────────────────────────────────
@@ -336,12 +336,21 @@ async def _ydl_stream_url(url: str) -> dict:
     _cookie_path = await get_cookie_file()
 
     def _extract():
+        # With cookies: web client (authenticated). Without: tv_embedded (no login needed).
+        client = ["web"] if _cookie_path else ["tv_embedded"]
         opts = {
             "quiet": True, "skip_download": True,
             "format": "bestvideo[ext=mp4][height<=1080]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+            "http_headers": {
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/124.0.0.0 Safari/537.36"
+                ),
+            },
             "extractor_args": {"youtube": {
-                "player_client": _PLAYER_CLIENTS,
-                "player_skip":   ["webpage"],
+                "player_client": client,
+                "player_skip":   ["webpage", "configs"],
             }},
         }
         if _cookie_path:
@@ -530,7 +539,7 @@ def register(app: Client):
                         "-ss", str(start), "-i", stream_info["video"],
                         "-ss", str(start), "-i", stream_info["audio"],
                         "-t", str(clip_s),
-                        "-c:v", "libx264", "-preset", "fast", "-crf", "28",
+                        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "30",
                         "-c:a", "aac", "-b:a", "128k",
                         "-movflags", "+faststart", "-y", out,
                     ], progress_cb)

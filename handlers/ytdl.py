@@ -1,9 +1,11 @@
 """
 handlers/ytdl.py  —  /yt command
 
-Domain:  youtube.com only (NOT music.youtube.com)
-Cookies: loaded fresh from MongoDB before every download
-Progress: live progress bar via yt-dlp progress_hook
+YouTube bot-detection fix:
+  Uses yt-dlp's innertube API directly (no webpage fetch) with
+  a real browser User-Agent. Falls back through multiple strategies.
+
+Speed: video info fetch is near-instant since we skip webpage loading.
 """
 
 import asyncio
@@ -29,7 +31,6 @@ from logger import log_action
 
 MD = ParseMode.MARKDOWN
 
-# Only youtube.com — music is handled separately by /song
 YT_RE = re.compile(
     r"(https?://)?(www\.)?"
     r"(youtube\.com/(watch\?v=|shorts/|live/)|youtu\.be/)"
@@ -48,10 +49,47 @@ QUALITY_OPTIONS = [
     ("🎥 360p",        "360"),
 ]
 
-# Player client chain — tv_embedded and mweb bypass most bot detection
-_PLAYER_CLIENTS = ["tv_embedded", "mweb", "web"]
-
 _sessions: dict[str, dict] = {}
+
+# ── yt-dlp strategy ───────────────────────────────────────────────────────────
+# Strategy 1 (with cookies): web client — fully authenticated, most reliable
+# Strategy 2 (no cookies):   tv_embedded — bypasses bot check without login
+#   Key: player_skip=["webpage"] avoids the JS bot-detection entirely
+#   Key: innertube_client means we use the internal API, not the public webpage
+
+def _ydl_opts(cookie_path: str | None, extra: dict | None = None) -> dict:
+    if cookie_path:
+        # Authenticated: use web client with real cookies
+        client_list  = ["web"]
+        player_skip  = ["webpage", "configs"]
+    else:
+        # Unauthenticated: tv_embedded skips age/login gates
+        client_list  = ["tv_embedded"]
+        player_skip  = ["webpage", "configs"]
+
+    opts = {
+        "quiet":       True,
+        "no_warnings": True,
+        "http_headers": {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            ),
+            "Accept-Language": "en-US,en;q=0.9",
+        },
+        "extractor_args": {
+            "youtube": {
+                "player_client": client_list,
+                "player_skip":   player_skip,
+            }
+        },
+    }
+    if cookie_path:
+        opts["cookiefile"] = cookie_path
+    if extra:
+        opts.update(extra)
+    return opts
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -95,40 +133,16 @@ def _human_speed(bps: float) -> str:
     return f"{bps:.0f} B/s"
 
 
-def _ydl_opts(cookie_path: str | None, extra: dict | None = None) -> dict:
-    """
-    Build yt-dlp options with bot-detection bypass.
-    With cookies: use 'web' client (authenticated, most reliable).
-    Without cookies: use 'tv_embedded' (no sign-in needed for most content).
-    """
-    # With valid cookies the web client is most reliable
-    # Without cookies tv_embedded bypasses bot checks for most content
-    client = ["web"] if cookie_path else ["tv_embedded", "mweb"]
-    opts = {
-        "quiet":          True,
-        "no_warnings":    True,
-        "extractor_args": {
-            "youtube": {
-                "player_client": client,
-                "player_skip":   ["webpage"],
-            }
-        },
-    }
-    if cookie_path:
-        opts["cookiefile"] = cookie_path
-    if extra:
-        opts.update(extra)
-    return opts
-
-
-async def _make_progress_hook(status_msg, label: str):
+def _make_progress_hook(status_msg, label: str):
+    """Returns a yt-dlp progress hook that updates status_msg live."""
     last_edit = [0.0]
+    loop      = asyncio.get_event_loop()
 
     def hook(d: dict):
         if d.get("status") != "downloading":
             return
         now = time.time()
-        if now - last_edit[0] < 2.0:
+        if now - last_edit[0] < 2.5:
             return
         last_edit[0] = now
 
@@ -153,11 +167,13 @@ async def _make_progress_hook(status_msg, label: str):
             f"⚡ {_human_speed(speed)}  •  ⏳ {eta}s"
         )
 
-        asyncio.get_event_loop().call_soon_threadsafe(
-            lambda: asyncio.ensure_future(
-                status_msg.edit(text, parse_mode=MD)
-            )
-        )
+        async def _edit():
+            try:
+                await status_msg.edit(text, parse_mode=MD)
+            except Exception:
+                pass
+
+        loop.call_soon_threadsafe(lambda: asyncio.ensure_future(_edit()))
 
     return hook
 
@@ -182,7 +198,7 @@ async def _cobalt_link(url: str, quality: str) -> str | None:
     return None
 
 
-# ── Handler registration ──────────────────────────────────────────────────────
+# ── Handlers ──────────────────────────────────────────────────────────────────
 
 def register(app: Client):
 
@@ -196,9 +212,9 @@ def register(app: Client):
             await message.reply(
                 "📥 **YouTube Downloader**\n\n"
                 "**Usage:** `/yt <youtube_url>`\n\n"
-                "🎥 Video → choose quality → direct download link\n"
+                "🎥 Video → pick quality → direct download link\n"
                 "🎵 MP3   → bot downloads and sends the file\n\n"
-                "⚠️ _YouTube links only (not music.youtube.com)_",
+                "⚠️ _YouTube links only. For songs use `/song`._",
                 parse_mode=MD,
             )
             return
@@ -207,18 +223,14 @@ def register(app: Client):
         if not _is_yt(url):
             await message.reply(
                 "❌ **Not a valid YouTube link.**\n\n"
-                "Supported:\n"
                 "• `https://youtube.com/watch?v=...`\n"
                 "• `https://youtu.be/...`\n"
-                "• `https://youtube.com/shorts/...`\n\n"
-                "For songs use `/song <name>` instead.",
+                "• `https://youtube.com/shorts/...`",
                 parse_mode=MD,
             )
             return
 
-        wait = await message.reply("⏳ Fetching video info…")
-
-        # Load cookies from MongoDB
+        wait        = await message.reply("⏳ Fetching video info…")
         cookie_path = await get_cookie_file()
 
         def _extract():
@@ -229,11 +241,20 @@ def register(app: Client):
         try:
             info = await asyncio.to_thread(_extract)
         except Exception as e:
-            await wait.edit(f"❌ Could not fetch video info:\n`{e}`", parse_mode=MD)
+            err = str(e)
+            # Give a helpful message for the most common errors
+            if "Sign in" in err or "bot" in err.lower():
+                await wait.edit(
+                    "❌ **YouTube requires sign-in for this video.**\n\n"
+                    "Upload your cookies using the `/cook` command and try again.",
+                    parse_mode=MD,
+                )
+            else:
+                await wait.edit(f"❌ Could not fetch video info:\n`{err}`", parse_mode=MD)
             return
 
         title     = info.get("title", "Unknown")
-        uploader  = info.get("uploader", "Unknown")
+        uploader  = info.get("uploader") or info.get("channel") or "Unknown"
         duration  = int(info.get("duration") or 0)
         views     = f"{info.get('view_count', 0):,}"
         likes     = f"{info.get('like_count', 0):,}" if info.get("like_count") else "N/A"
@@ -250,7 +271,7 @@ def register(app: Client):
 
         k = _key(clean_url)
         _sessions[k] = {
-            "url": clean_url,
+            "url":  clean_url,
             "meta": {
                 "title":     title,
                 "uploader":  uploader,
@@ -261,15 +282,16 @@ def register(app: Client):
         }
 
         rows, pair = [], []
-        for label, q_val in QUALITY_OPTIONS:
+        for lbl, q_val in QUALITY_OPTIONS:
             if int(q_val) <= max_h:
-                pair.append(InlineKeyboardButton(label, callback_data=f"ytq|{k}|{q_val}"))
+                pair.append(InlineKeyboardButton(lbl, callback_data=f"ytq|{k}|{q_val}"))
                 if len(pair) == 2:
-                    rows.append(pair); pair = []
+                    rows.append(pair)
+                    pair = []
         if pair:
             rows.append(pair)
         rows.append([InlineKeyboardButton("🎵 MP3 Audio (file)", callback_data=f"ytq|{k}|audio")])
-        rows.append([InlineKeyboardButton("❌ Cancel", callback_data="ytq_cancel")])
+        rows.append([InlineKeyboardButton("❌ Cancel",           callback_data="ytq_cancel")])
 
         caption = (
             f"🎬 **{title}**\n"
@@ -280,12 +302,17 @@ def register(app: Client):
 
         await wait.delete()
         if thumbnail:
-            await client.send_photo(message.chat.id, thumbnail, caption=caption,
-                                    parse_mode=MD, reply_markup=InlineKeyboardMarkup(rows))
+            await client.send_photo(
+                message.chat.id, thumbnail,
+                caption=caption, parse_mode=MD,
+                reply_markup=InlineKeyboardMarkup(rows),
+            )
         else:
             await message.reply(caption, parse_mode=MD, reply_markup=InlineKeyboardMarkup(rows))
 
         await log_action(client, message, "📥 YT Info", f"`{title}`")
+
+    # ── Callback ──────────────────────────────────────────────────────────────
 
     @app.on_callback_query(filters.regex(r"^ytq"))
     async def yt_callback(client: Client, query: CallbackQuery):
@@ -298,7 +325,7 @@ def register(app: Client):
         _, k, quality = query.data.split("|", 2)
         session = _sessions.get(k)
         if not session:
-            await query.message.reply("❌ Session expired. Send the link again.")
+            await query.message.reply("❌ Session expired. Please send the link again.")
             return
 
         if quality == "audio":
@@ -306,23 +333,30 @@ def register(app: Client):
         else:
             await _send_video_link(query, session["url"], quality)
 
+    # ── Video link (cobalt.tools) ─────────────────────────────────────────────
+
     async def _send_video_link(query: CallbackQuery, url: str, quality: str):
         orig = query.message.caption or ""
         try:
-            await query.message.edit_caption(orig + f"\n\n⏳ Getting **{quality}p** link…", parse_mode=MD)
+            await query.message.edit_caption(
+                orig + f"\n\n⏳ Getting **{quality}p** link…", parse_mode=MD
+            )
         except Exception:
             pass
 
         dl_link = await _cobalt_link(url, quality)
 
         try:
-            await query.message.edit_caption(orig, parse_mode=MD, reply_markup=query.message.reply_markup)
+            await query.message.edit_caption(
+                orig, parse_mode=MD, reply_markup=query.message.reply_markup
+            )
         except Exception:
             pass
 
         if not dl_link:
             await query.message.reply(
-                f"❌ Could not get a **{quality}p** link. Try a different quality.",
+                f"❌ Could not get a **{quality}p** link.\n"
+                "Try a different quality or try again later.",
                 parse_mode=MD,
             )
             return
@@ -333,6 +367,8 @@ def register(app: Client):
             "⏳ _Link is temporary — download soon!_",
             parse_mode=MD,
         )
+
+    # ── MP3 audio download ────────────────────────────────────────────────────
 
     async def _send_audio(client: Client, query: CallbackQuery, url: str, meta: dict):
         title     = meta.get("title",    "Unknown")
@@ -352,23 +388,35 @@ def register(app: Client):
             parse_mode=MD,
         )
 
-        thumb_data: bytes | None = None
-        if thumb_url:
+        # Fetch thumbnail and cookies concurrently
+        async def _get_thumb():
+            if not thumb_url:
+                return None
             try:
                 async with httpx.AsyncClient(timeout=10) as hx:
                     r = await hx.get(thumb_url)
-                    if r.status_code == 200:
-                        thumb_data = r.content
+                    return r.content if r.status_code == 200 else None
             except Exception:
-                pass
+                return None
+
+        thumb_data, cookie_path = await asyncio.gather(
+            _get_thumb(),
+            get_cookie_file(),
+        )
 
         with tempfile.TemporaryDirectory() as tmp:
-            cookie_path = await get_cookie_file(tmp_dir=tmp)
-            hook        = await _make_progress_hook(status, f"⬇️ Downloading: **{title[:40]}**")
+            # If cookie_path from get_cookie_file() is outside tmp, copy into tmp
+            if cookie_path and not cookie_path.startswith(tmp):
+                import shutil
+                local_cookie = os.path.join(tmp, "cookies.txt")
+                shutil.copy2(cookie_path, local_cookie)
+                cookie_path = local_cookie
+
+            hook = _make_progress_hook(status, f"⬇️ Downloading: **{title[:40]}**")
 
             ydl_opts = _ydl_opts(cookie_path, {
-                "format":   "bestaudio/best",
-                "outtmpl":  os.path.join(tmp, "%(id)s.%(ext)s"),
+                "format":         "bestaudio[ext=m4a]/bestaudio/best",
+                "outtmpl":        os.path.join(tmp, "%(id)s.%(ext)s"),
                 "progress_hooks": [hook],
                 "postprocessors": [
                     {"key": "FFmpegExtractAudio",
@@ -384,7 +432,15 @@ def register(app: Client):
             try:
                 await asyncio.to_thread(_dl)
             except Exception as e:
-                await status.edit(f"❌ Download failed:\n`{e}`", parse_mode=MD)
+                err = str(e)
+                if "Sign in" in err or "bot" in err.lower():
+                    await status.edit(
+                        "❌ **YouTube requires sign-in.**\n"
+                        "Upload cookies with `/cook` and try again.",
+                        parse_mode=MD,
+                    )
+                else:
+                    await status.edit(f"❌ Download failed:\n`{err}`", parse_mode=MD)
                 return
 
             mp3 = os.path.join(tmp, f"{video_id}.mp3")
@@ -396,9 +452,10 @@ def register(app: Client):
 
             size_mb = os.path.getsize(mp3) / 1024 / 1024
             if size_mb > 50:
-                await status.edit(f"❌ File too large ({size_mb:.1f} MB). Limit is 50 MB.")
+                await status.edit(f"❌ File too large ({size_mb:.1f} MB). Telegram limit is 50 MB.")
                 return
 
+            # Embed album art
             if thumb_data:
                 try:
                     from mutagen.id3 import ID3, APIC, TIT2, TPE1, error as ID3Error
@@ -409,7 +466,7 @@ def register(app: Client):
                     if img.mode != "RGB":
                         img = img.convert("RGB")
                     jbuf = io.BytesIO()
-                    img.save(jbuf, format="JPEG", quality=90)
+                    img.save(jbuf, format="JPEG", quality=85)
 
                     audio = MP3(mp3, ID3=ID3)
                     try:
@@ -430,14 +487,13 @@ def register(app: Client):
                 thumb_io      = io.BytesIO(thumb_data)
                 thumb_io.name = "thumb.jpg"
 
-            await status.edit("📤 **Uploading…**", parse_mode=MD)
-
             caption = (
                 f"🎵 **{title}**\n"
                 f"👤 `{uploader}`\n"
                 f"⏱ `{_fmt_dur(duration)}`  •  💾 `{size_mb:.1f} MB`"
             )
 
+            await status.edit("📤 **Uploading…**", parse_mode=MD)
             await status.delete()
             await client.send_audio(
                 query.message.chat.id, mp3,

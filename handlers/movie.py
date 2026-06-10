@@ -189,7 +189,7 @@ def register(app: Client):
         wait  = await message.reply(f"🔍 Searching **{query}**…", parse_mode=MD)
 
         # Use free JustWatch public API (no token needed)
-        items = await jw.search_all(query, page_size=8)
+        items = await jw.search(query, page_size=8)
 
         if not items:
             await wait.edit(f"❌ No results found for **{query}** on JustWatch.", parse_mode=MD)
@@ -239,12 +239,14 @@ def register(app: Client):
         await query.answer()
         await query.message.delete()
 
-    # Also handle "Check OTT" button from /imdb
+    # Handle "Check OTT" button from /imdb card
+    # callback_data format: imdb_ott|{mtype}|{tmdb_id}|{title}
     @app.on_callback_query(filters.regex(r"^imdb_ott\|"))
     async def imdb_ott_cb(client: Client, query: CallbackQuery):
         await query.answer("🔍 Searching JustWatch…")
-        title = query.data.split("|", 1)[1]
-        items = await jw.search_all(title, page_size=3)
+        parts = query.data.split("|", 3)
+        title = parts[3] if len(parts) >= 4 else parts[-1]
+        items = await jw.search(title, page_size=4)
         item  = items[0] if items else None
         await _send_ott_detail(client, query.message, item, title, reply=True)
 

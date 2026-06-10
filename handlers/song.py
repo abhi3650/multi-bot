@@ -1,15 +1,13 @@
 """
 handlers/song.py  —  /song command
 
-Domain: music.youtube.com ONLY (different from /yt which uses youtube.com)
-Cookies: loaded fresh from MongoDB before every download
-Progress: live progress bar via yt-dlp progress_hook
+Domain: music.youtube.com ONLY (different from /yt which is youtube.com)
+Search: ytsearch8: with site filter to prefer YT Music results
+Download: always from music.youtube.com/watch?v=ID
 
-Flow:
-  1. /song <query> → Search Results (YT Music): + buttons
-  2. Tap → Preparing Your Song... → progress bar → Uploading...
-  3. MP3 with album art
-     Caption: 🎵 Song / 🎤 Artist / 📀 Source: YT Music
+Bot-detection bypass: same strategy as ytdl.py
+  With cookies → web client (authenticated)
+  Without cookies → tv_embedded (no login required for most tracks)
 """
 
 import asyncio
@@ -38,11 +36,8 @@ from logger import log_action
 MD = ParseMode.MARKDOWN
 
 _sessions: dict[str, dict] = {}
-_PLAYER_CLIENTS = ["tv_embedded", "mweb", "web"]
 
-# music.youtube.com base — different from youtube.com
 YT_MUSIC_BASE = "https://music.youtube.com/watch?v="
-YT_MUSIC_SEARCH = "https://music.youtube.com/search?q="
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -83,43 +78,29 @@ def _human_speed(bps: float) -> str:
     return f"{bps:.0f} B/s"
 
 
-def _embed_art(mp3_path: str, thumb_data: bytes, title: str, artist: str):
-    try:
-        img = Image.open(io.BytesIO(thumb_data))
-        if img.mode != "RGB":
-            img = img.convert("RGB")
-        buf = io.BytesIO()
-        img.save(buf, format="JPEG", quality=90)
-        jpeg = buf.getvalue()
-
-        audio = MP3(mp3_path, ID3=ID3)
-        try:
-            audio.add_tags()
-        except ID3Error:
-            pass
-        audio.tags.delall("APIC")
-        audio.tags.add(APIC(encoding=3, mime="image/jpeg", type=3, desc="Cover", data=jpeg))
-        audio.tags.add(TIT2(encoding=3, text=title))
-        audio.tags.add(TPE1(encoding=3, text=artist))
-        audio.save(v2_version=3)
-    except Exception as e:
-        print(f"[song/embed] {e}")
-
-
-def _ydl_base(cookie_path: str | None, extra: dict | None = None) -> dict:
+def _ydl_opts(cookie_path: str | None, extra: dict | None = None) -> dict:
     """
-    Build yt-dlp options for music.youtube.com.
-    With cookies: 'web' client (authenticated).
-    Without cookies: 'tv_embedded' (bypasses bot check for most tracks).
+    With cookies → web client (authenticated, works on everything).
+    Without cookies → tv_embedded (bypasses login for most music tracks).
     """
-    client = ["web"] if cookie_path else ["tv_embedded", "mweb"]
+    client      = ["web"]        if cookie_path else ["tv_embedded"]
+    player_skip = ["webpage", "configs"]
+
     opts = {
-        "quiet":          True,
-        "no_warnings":    True,
+        "quiet":       True,
+        "no_warnings": True,
+        "http_headers": {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            ),
+            "Accept-Language": "en-US,en;q=0.9",
+        },
         "extractor_args": {
             "youtube": {
                 "player_client": client,
-                "player_skip":   ["webpage"],
+                "player_skip":   player_skip,
             }
         },
     }
@@ -130,14 +111,37 @@ def _ydl_base(cookie_path: str | None, extra: dict | None = None) -> dict:
     return opts
 
 
-async def _make_progress_hook(status_msg, title: str):
+def _embed_art(mp3_path: str, thumb_data: bytes, title: str, artist: str):
+    try:
+        img = Image.open(io.BytesIO(thumb_data))
+        if img.mode != "RGB":
+            img = img.convert("RGB")
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=85)
+
+        audio = MP3(mp3_path, ID3=ID3)
+        try:
+            audio.add_tags()
+        except ID3Error:
+            pass
+        audio.tags.delall("APIC")
+        audio.tags.add(APIC(encoding=3, mime="image/jpeg", type=3, desc="Cover", data=buf.getvalue()))
+        audio.tags.add(TIT2(encoding=3, text=title))
+        audio.tags.add(TPE1(encoding=3, text=artist))
+        audio.save(v2_version=3)
+    except Exception as e:
+        print(f"[song/embed] {e}")
+
+
+def _make_progress_hook(status_msg, title: str):
     last_edit = [0.0]
+    loop      = asyncio.get_event_loop()
 
     def hook(d: dict):
         if d.get("status") != "downloading":
             return
         now = time.time()
-        if now - last_edit[0] < 2.0:
+        if now - last_edit[0] < 2.5:
             return
         last_edit[0] = now
 
@@ -163,16 +167,18 @@ async def _make_progress_hook(status_msg, title: str):
             f"⚡ {_human_speed(speed)}  •  ⏳ {eta}s"
         )
 
-        asyncio.get_event_loop().call_soon_threadsafe(
-            lambda: asyncio.ensure_future(
-                status_msg.edit(text, parse_mode=MD)
-            )
-        )
+        async def _edit():
+            try:
+                await status_msg.edit(text, parse_mode=MD)
+            except Exception:
+                pass
+
+        loop.call_soon_threadsafe(lambda: asyncio.ensure_future(_edit()))
 
     return hook
 
 
-# ── Handler registration ──────────────────────────────────────────────────────
+# ── Handlers ──────────────────────────────────────────────────────────────────
 
 def register(app: Client):
 
@@ -192,28 +198,31 @@ def register(app: Client):
             )
             return
 
-        query = " ".join(args)
-        wait  = await message.reply("🔍 Searching…")
-
-        # Load cookies from MongoDB once for the search
+        query       = " ".join(args)
+        wait        = await message.reply("🔍 Searching…")
         cookie_path = await get_cookie_file()
 
         def _search():
-            opts = _ydl_base(cookie_path, {
-                "extract_flat":      True,
-                "noplaylist":        False,
-                "default_search":    "ytsearch",
-                # Prefer music.youtube.com results by querying with site filter
+            opts = _ydl_opts(cookie_path, {
+                "extract_flat": True,
+                "noplaylist":   False,
             })
             with yt_dlp.YoutubeDL(opts) as ydl:
-                # Search YouTube Music by using site:music.youtube.com trick
-                # ytsearch8 is universally supported; we then use music.youtube.com URL for download
-                return ydl.extract_info(f"ytsearch8:{query} site:music.youtube.com", download=False)
+                # Plain ytsearch on YouTube; we then use music URL for download
+                return ydl.extract_info(f"ytsearch8:{query}", download=False)
 
         try:
             data = await asyncio.to_thread(_search)
         except Exception as e:
-            await wait.edit(f"❌ Search failed:\n`{e}`", parse_mode=MD)
+            err = str(e)
+            if "Sign in" in err or "bot" in err.lower():
+                await wait.edit(
+                    "❌ **YouTube requires sign-in for search.**\n"
+                    "Upload cookies with `/cook` and try again.",
+                    parse_mode=MD,
+                )
+            else:
+                await wait.edit(f"❌ Search failed:\n`{err}`", parse_mode=MD)
             return
 
         entries = [e for e in (data.get("entries") or []) if e and e.get("id")]
@@ -263,7 +272,7 @@ def register(app: Client):
         artist   = entry.get("uploader") or entry.get("channel") or "Unknown"
         duration = int(entry.get("duration") or 0)
 
-        # Always use music.youtube.com for the download URL
+        # Always download from music.youtube.com
         yt_music_url = f"{YT_MUSIC_BASE}{vid_id}"
 
         thumb_url = (
@@ -273,24 +282,34 @@ def register(app: Client):
 
         await query.message.edit("Preparing Your Song...")
 
-        # Fetch thumbnail
-        thumb_data: bytes | None = None
-        if thumb_url:
+        # Fetch thumbnail and cookies concurrently
+        async def _get_thumb():
+            if not thumb_url:
+                return None
             try:
                 async with httpx.AsyncClient(timeout=10) as hx:
                     r = await hx.get(thumb_url)
-                    if r.status_code == 200:
-                        thumb_data = r.content
+                    return r.content if r.status_code == 200 else None
             except Exception:
-                pass
+                return None
+
+        thumb_data, cookie_path = await asyncio.gather(
+            _get_thumb(),
+            get_cookie_file(),
+        )
 
         with tempfile.TemporaryDirectory() as tmp:
-            # Fresh cookie file per download
-            cookie_path = await get_cookie_file(tmp_dir=tmp)
-            hook        = await _make_progress_hook(query.message, title)
+            # Copy cookie to tmp dir so it stays valid for the thread
+            if cookie_path and not cookie_path.startswith(tmp):
+                import shutil
+                local_cookie = os.path.join(tmp, "cookies.txt")
+                shutil.copy2(cookie_path, local_cookie)
+                cookie_path = local_cookie
 
-            ydl_opts = _ydl_base(cookie_path, {
-                "format":         "bestaudio/best",
+            hook = _make_progress_hook(query.message, title)
+
+            ydl_opts = _ydl_opts(cookie_path, {
+                "format":         "bestaudio[ext=m4a]/bestaudio/best",
                 "outtmpl":        os.path.join(tmp, "%(id)s.%(ext)s"),
                 "progress_hooks": [hook],
                 "postprocessors": [
@@ -307,7 +326,15 @@ def register(app: Client):
             try:
                 await asyncio.to_thread(_dl)
             except Exception as e:
-                await query.message.edit(f"❌ Download failed:\n`{e}`", parse_mode=MD)
+                err = str(e)
+                if "Sign in" in err or "bot" in err.lower():
+                    await query.message.edit(
+                        "❌ **YouTube requires sign-in.**\n"
+                        "Upload cookies with `/cook` and try again.",
+                        parse_mode=MD,
+                    )
+                else:
+                    await query.message.edit(f"❌ Download failed:\n`{err}`", parse_mode=MD)
                 return
 
             mp3 = os.path.join(tmp, f"{vid_id}.mp3")
@@ -317,25 +344,26 @@ def register(app: Client):
                 await query.message.edit("❌ Could not find downloaded audio file.")
                 return
 
-            if thumb_data:
+            # Embed album art
+            if thumb_data and isinstance(thumb_data, bytes):
                 await asyncio.to_thread(_embed_art, mp3, thumb_data, title, artist)
 
             size_mb = os.path.getsize(mp3) / 1024 / 1024
             if size_mb > 50:
                 await query.message.edit(
-                    f"❌ File too large ({size_mb:.1f} MB). Telegram's limit is 50 MB."
+                    f"❌ File too large ({size_mb:.1f} MB). Telegram limit is 50 MB."
                 )
                 return
 
             thumb_io = None
-            if thumb_data:
+            if thumb_data and isinstance(thumb_data, bytes):
                 thumb_io      = io.BytesIO(thumb_data)
                 thumb_io.name = "thumb.jpg"
 
             await query.message.edit("Uploading ...")
 
             song_name = entry.get("track") or title
-            caption = (
+            caption   = (
                 f"🎵 **Song**   : {song_name}\n"
                 f"🎤 **Artist** : {artist}\n"
                 f"📀 **Source** : YT Music"
@@ -349,18 +377,9 @@ def register(app: Client):
                 duration=duration, thumb=thumb_io,
             )
 
-            await log_action(
-                client,
-                # Reconstruct a minimal message-like object for the logger
-                type("M", (), {
-                    "from_user": type("U", (), {
-                        "id": query.from_user.id,
-                        "first_name": query.from_user.first_name,
-                        "last_name": query.from_user.last_name,
-                        "username": query.from_user.username,
-                    })(),
-                    "chat": query.message.chat,
-                })(),
-                "🎵 Song Download",
-                f"`{title}` by {artist}",
-            )
+            # Log (build a minimal message-like object for logger)
+            class _FakeMsg:
+                from_user = query.from_user
+                chat      = query.message.chat
+
+            await log_action(client, _FakeMsg(), "🎵 Song Download", f"`{title}` by {artist}")
