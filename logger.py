@@ -34,20 +34,21 @@ def _user_line(message: Message) -> str:
 async def log_action(client: Client, message: Message, action: str, detail: str = "") -> None:
     """
     Send an activity log to LOG_CHANNEL.
-
-    Args:
-        client:  Pyrogram bot client
-        message: The triggering Message (for user info)
-        action:  Short label e.g. "🎵 Song Download", "📸 Screenshot"
-        detail:  Additional context e.g. song title, file name, query
+    Silently skipped if LOG_CHANNEL is 0 or not configured.
     """
     if not LOG_CHANNEL:
         return
 
+    # Validate the channel ID looks usable before trying
+    if LOG_CHANNEL > 0 or LOG_CHANNEL > -100:
+        _log.debug("[logger] LOG_CHANNEL=%d looks invalid, skipping", LOG_CHANNEL)
+        return
+
     user_line = _user_line(message)
-    lines = [
-        f"**#{action.replace(' ', '_').upper()}**",
-        f"",
+    tag       = action.replace(" ", "_").upper().replace("-", "_")
+    lines     = [
+        f"**#{tag}**",
+        "",
         f"👤 **User** : {user_line}",
     ]
     if detail:
@@ -63,4 +64,5 @@ async def log_action(client: Client, message: Message, action: str, detail: str 
             disable_web_page_preview=True,
         )
     except Exception as e:
-        _log.warning("[logger] Failed to send log: %s", e)
+        # Log warning but never crash the handler
+        _log.debug("[logger] Could not send log: %s", e)

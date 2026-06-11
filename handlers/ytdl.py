@@ -58,31 +58,35 @@ _sessions: dict[str, dict] = {}
 #   Key: innertube_client means we use the internal API, not the public webpage
 
 def _ydl_opts(cookie_path: str | None, extra: dict | None = None) -> dict:
+    """
+    Build yt-dlp options.
+
+    Client strategy (in order of reliability for server environments):
+      android       — works without cookies for most content, fast innertube API
+      android_music — fallback for music content
+      tv_embedded   — fallback when android is blocked
+      web           — with cookies: fully authenticated, most reliable
+
+    We always try android first because it uses the Innertube API directly,
+    bypassing the webpage bot-detection entirely.
+    """
     if cookie_path:
-        # Authenticated: use web client with real cookies
-        client_list  = ["web"]
-        player_skip  = ["webpage", "configs"]
+        # With cookies: web is most reliable (full session auth)
+        client_list = ["web", "android"]
     else:
-        # Unauthenticated: tv_embedded skips age/login gates
-        client_list  = ["tv_embedded"]
-        player_skip  = ["webpage", "configs"]
+        # Without cookies: android bypasses bot-check for most content
+        client_list = ["android", "android_music", "tv_embedded"]
 
     opts = {
         "quiet":       True,
         "no_warnings": True,
-        "http_headers": {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            ),
-            "Accept-Language": "en-US,en;q=0.9",
-        },
         "extractor_args": {
             "youtube": {
                 "player_client": client_list,
-                "player_skip":   player_skip,
             }
+        },
+        "http_headers": {
+            "User-Agent": "com.google.android.youtube/17.36.4 (Linux; U; Android 13) gzip",
         },
     }
     if cookie_path:

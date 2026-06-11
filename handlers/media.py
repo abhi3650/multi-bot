@@ -140,38 +140,25 @@ def _run_ff(args: list[str], progress_cb=None) -> bool:
 
 async def _get_cdn_url(client: Client, media_obj) -> str | None:
     """
-    Get a direct streamable URL for the file.
+    Get a direct CDN URL for ffmpeg to stream from.
 
-    Strategy:
-    1. Try Bot API getFile (works ≤ 20 MB, instant)
-    2. For larger files: use Pyrogram MTProto get_file which works for any size
-       Pyrogram returns the file_path URL directly when using its own get_file.
+    Bot API getFile works for files ≤ 20 MB and returns a CDN URL
+    that ffmpeg can seek on directly (instant, no download needed).
 
-    Returns None only if both methods fail.
+    For files > 20 MB we return None — the caller falls back to
+    full MTProto download via _download_tg().
     """
+    file_size = getattr(media_obj, "file_size", 0) or 0
+    if file_size > 20 * 1024 * 1024:
+        return None  # Too large for Bot API — caller uses MTProto download
     try:
         tg_file = await client.get_file(media_obj.file_id)
         if tg_file.file_path:
-            # Pyrogram may return either a relative path or a full HTTPS URL
             if tg_file.file_path.startswith("http"):
                 return tg_file.file_path
             return f"https://api.telegram.org/file/bot{BOT_TOKEN}/{tg_file.file_path}"
     except Exception:
         pass
-
-    # Fallback: try via the Pyrogram MTProto client (handles any file size)
-    try:
-        import pyrogram_helper as pyro
-        pyro_client = pyro.get_client()
-        if pyro_client:
-            tg_file2 = await pyro_client.get_file(media_obj.file_id)
-            if tg_file2 and tg_file2.file_path:
-                if tg_file2.file_path.startswith("http"):
-                    return tg_file2.file_path
-                return f"https://api.telegram.org/file/bot{BOT_TOKEN}/{tg_file2.file_path}"
-    except Exception:
-        pass
-
     return None
 
 
@@ -336,21 +323,15 @@ async def _ydl_stream_url(url: str) -> dict:
     _cookie_path = await get_cookie_file()
 
     def _extract():
-        # With cookies: web client (authenticated). Without: tv_embedded (no login needed).
-        client = ["web"] if _cookie_path else ["tv_embedded"]
+        client = ["web", "android"] if _cookie_path else ["android", "tv_embedded"]
         opts = {
             "quiet": True, "skip_download": True,
             "format": "bestvideo[ext=mp4][height<=1080]+bestaudio[ext=m4a]/best[ext=mp4]/best",
             "http_headers": {
-                "User-Agent": (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/124.0.0.0 Safari/537.36"
-                ),
+                "User-Agent": "com.google.android.youtube/17.36.4 (Linux; U; Android 13) gzip",
             },
             "extractor_args": {"youtube": {
                 "player_client": client,
-                "player_skip":   ["webpage", "configs"],
             }},
         }
         if _cookie_path:

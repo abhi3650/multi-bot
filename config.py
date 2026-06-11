@@ -24,16 +24,29 @@ MONGO_DB        = os.getenv("MONGO_DB",  "multipurpose_bot")
 # LOG_CHANNEL  — all bot activity is logged here
 # DUMP_CHANNEL — files forwarded here for permanent /link storage
 def _chan(val: str) -> int:
-    """Parse a channel ID env var safely. Handles missing -100 prefix."""
-    val = (val or "").strip()
-    if not val or val == "0":
+    """
+    Parse a Telegram channel/group ID from an env var.
+
+    Handles all formats:
+      -1001234567890   (standard supergroup/channel ID)
+      1001234567890    (same without minus — some platforms strip it)
+      -100_1234567890  (with underscore separator)
+      1234567890       (legacy group ID — returned as-is negative)
+    """
+    val = (val or "").strip().replace("_", "").replace(" ", "")
+    if not val or val in ("0", ""):
         return 0
     try:
         n = int(val)
-        # Koyeb sometimes strips the minus — restore it for supergroups/channels
-        if n > 0 and n > 1_000_000_000:
-            n = -int(f"100{n}")
-        return n
+        # Already negative and looks like a channel/supergroup — good
+        if n < 0:
+            return n
+        # Positive number
+        if n > 1_000_000_000:
+            # Supergroup/channel ID without the -100 prefix
+            return -int(f"100{n}")
+        # Small positive — legacy group, negate it
+        return -n if n > 0 else 0
     except ValueError:
         return 0
 

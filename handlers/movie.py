@@ -189,7 +189,7 @@ def register(app: Client):
         wait  = await message.reply(f"🔍 Searching **{query}**…", parse_mode=MD)
 
         # Use free JustWatch public API (no token needed)
-        items = await jw.search(query, page_size=8)
+        items = await jw.search(query, TMDB_API_KEY, page_size=8)
 
         if not items:
             await wait.edit(f"❌ No results found for **{query}** on JustWatch.", parse_mode=MD)
@@ -246,7 +246,7 @@ def register(app: Client):
         await query.answer("🔍 Searching JustWatch…")
         parts = query.data.split("|", 3)
         title = parts[3] if len(parts) >= 4 else parts[-1]
-        items = await jw.search(title, page_size=4)
+        items = await jw.search(title, TMDB_API_KEY, page_size=4)
         item  = items[0] if items else None
         await _send_ott_detail(client, query.message, item, title, reply=True)
 
@@ -254,33 +254,37 @@ def register(app: Client):
         client, target: Message,
         item: dict | None, query_title: str, reply: bool,
     ):
-        """Format and send OTT availability from a JustWatch item dict."""
+        """
+        Fetch OTT availability from TMDB Watch Providers and send formatted result.
+        item: TMDB search result dict (has id, media_type, title/name, release date)
+        """
+        jw_url  = f"https://www.justwatch.com/in/search?q={query_title.replace(' ', '+')}"
+        kb      = InlineKeyboardMarkup([[InlineKeyboardButton("🔍 View on JustWatch", url=jw_url)]])
+
         if not item:
             text = (
                 f"≡ **{query_title}**\n\n"
                 f"🔥 **Availability :-**\n"
-                f"_Not available for streaming in India yet._\n\n"
+                f"_Not found on TMDB._\n\n"
                 f"CC ~ @{BOT_USERNAME}"
             )
-            jw_url = f"https://www.justwatch.com/in/search?q={query_title.replace(' ', '+')}"
-            kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔍 JustWatch", url=jw_url)]])
             await (target.reply(text, parse_mode=MD, reply_markup=kb) if reply
                    else target.edit(text, parse_mode=MD, reply_markup=kb))
             return
 
-        title     = item.get("title", query_title)
-        year      = item.get("original_release_year", "")
-        offers    = item.get("offers") or []
-        jw_id     = item.get("id")
-        obj_type  = item.get("object_type", "movie")
+        # Resolve title + year from TMDB item
+        title    = item.get("title") or item.get("name") or query_title
+        raw_date = item.get("release_date") or item.get("first_air_date") or ""
+        year     = raw_date[:4] if raw_date else ""
+        mtype    = item.get("media_type", "movie")
+        tmdb_id  = item.get("id", 0)
 
-        # If no offers in search result, fetch full detail
-        if not offers and jw_id:
-            detail = await jw.get_title(jw_id, obj_type)
-            if detail:
-                offers = detail.get("offers") or []
+        # Fetch providers from TMDB
+        pdata    = await jw.get_providers(tmdb_id, mtype, TMDB_API_KEY, country="IN")
+        providers = pdata.get("providers", {})
+        jw_link  = pdata.get("link") or jw_url
 
-        avail_str = await jw.format_offers(offers)
+        avail_str = await jw.format_providers(providers, title)
 
         year_str   = f" ({year})" if year else ""
         title_line = f"≡ **{title}**{year_str}"
@@ -291,9 +295,7 @@ def register(app: Client):
             f"CC ~ @{BOT_USERNAME}"
         )
 
-        jw_url = f"https://www.justwatch.com/in/search?q={title.replace(' ', '+')}"
-        kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔍 JustWatch", url=jw_url)]])
-
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔍 View on JustWatch", url=jw_link)]])
         if reply:
             await target.reply(text, parse_mode=MD, reply_markup=kb)
         else:

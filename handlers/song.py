@@ -80,28 +80,27 @@ def _human_speed(bps: float) -> str:
 
 def _ydl_opts(cookie_path: str | None, extra: dict | None = None) -> dict:
     """
-    With cookies → web client (authenticated, works on everything).
-    Without cookies → tv_embedded (bypasses login for most music tracks).
+    Build yt-dlp options for music.youtube.com downloads.
+
+    android_music targets the YouTube Music innertube API directly —
+    the same client that the YT Music Android app uses.
+    This bypasses webpage bot-detection entirely.
     """
-    client      = ["web"]        if cookie_path else ["tv_embedded"]
-    player_skip = ["webpage", "configs"]
+    if cookie_path:
+        client_list = ["web", "android_music", "android"]
+    else:
+        client_list = ["android_music", "android", "tv_embedded"]
 
     opts = {
         "quiet":       True,
         "no_warnings": True,
-        "http_headers": {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            ),
-            "Accept-Language": "en-US,en;q=0.9",
-        },
         "extractor_args": {
             "youtube": {
-                "player_client": client,
-                "player_skip":   player_skip,
+                "player_client": client_list,
             }
+        },
+        "http_headers": {
+            "User-Agent": "com.google.android.apps.youtube.music/6.21.52 (Linux; U; Android 13) gzip",
         },
     }
     if cookie_path:

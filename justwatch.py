@@ -1,17 +1,15 @@
 """
-justwatch.py — Async JustWatch wrapper
+justwatch.py — OTT availability via TMDB Watch Providers
 
-Uses the FREE public API (apis.justwatch.com/content/) — no token, no contract.
-Based on the JustWatchAPI open-source library (github.com/dawoudt/JustWatchAPI).
+JustWatch's public API (apis.justwatch.com/content/) returns 403 from cloud
+servers due to Cloudflare bot protection. TMDB Watch Providers is the reliable
+server-side alternative — it sources data from JustWatch and always works.
 
-Key endpoints:
-  GET  /locales/state                          — country → locale mapping
-  POST /titles/{locale}/popular                — search (query in payload)
-  GET  /providers/locale/{locale}              — provider id → name
-  GET  /titles/{type}/{id}/locale/{locale}     — title detail with offers
+Endpoints:
+  GET /3/{type}/{id}/watch/providers  → streaming availability by country
+  GET /3/search/multi                 → title search to resolve TMDB ID
 """
 
-import asyncio
 import logging
 from typing import Optional
 
@@ -19,101 +17,8 @@ import httpx
 
 log = logging.getLogger(__name__)
 
-_HEADER = {
-    "User-Agent": "JustWatch client (github.com/dawoudt/JustWatchAPI)",
-}
-_BASE = "https://apis.justwatch.com/content"
+_TMDB_BASE = "https://api.themoviedb.org/3"
 
-# India locale — set at module level, resolved once
-_LOCALE: str = "en_IN"
-
-# Provider id → clear name cache (loaded once per process)
-_provider_cache: dict[int, str] = {}
-
-
-# ── Locale resolution ─────────────────────────────────────────────────────────
-
-async def resolve_locale(country: str = "IN") -> str:
-    """
-    Resolve country code → full locale string using the JustWatch locales API.
-    Defaults to 'en_IN' if the call fails.
-    """
-    try:
-        async with httpx.AsyncClient(timeout=10, headers=_HEADER) as hx:
-            r = await hx.get(f"{_BASE}/locales/state")
-            if r.status_code == 200:
-                for item in r.json():
-                    if item.get("iso_3166_2") == country or item.get("country") == country:
-                        return item["full_locale"]
-    except Exception as exc:
-        log.debug("[jw/locale] %s", exc)
-    return "en_IN"
-
-
-# ── Provider cache ────────────────────────────────────────────────────────────
-
-async def _ensure_providers(locale: str = _LOCALE) -> dict[int, str]:
-    global _provider_cache
-    if _provider_cache:
-        return _provider_cache
-    try:
-        async with httpx.AsyncClient(timeout=10, headers=_HEADER) as hx:
-            r = await hx.get(f"{_BASE}/providers/locale/{locale}")
-            if r.status_code == 200:
-                for p in r.json():
-                    _provider_cache[int(p["id"])] = p.get("clear_name") or p.get("short_name", str(p["id"]))
-                log.info("[jw/providers] Loaded %d providers", len(_provider_cache))
-    except Exception as exc:
-        log.warning("[jw/providers] %s", exc)
-    return _provider_cache
-
-
-# ── Search ────────────────────────────────────────────────────────────────────
-
-async def search(query: str, locale: str = _LOCALE, page_size: int = 8) -> list[dict]:
-    """
-    Search JustWatch for titles matching query.
-    Returns list of item dicts — each has: id, title, object_type, offers, original_release_year.
-    No token required.
-    """
-    url = f"{_BASE}/titles/{locale}/popular"
-    payload = {
-        "query":     query,
-        "page_size": page_size,
-        "page":      1,
-    }
-    try:
-        async with httpx.AsyncClient(timeout=15, headers=_HEADER) as hx:
-            r = await hx.post(url, json=payload)
-            if r.status_code == 200:
-                return r.json().get("items", [])
-            log.warning("[jw/search] HTTP %s for %r", r.status_code, query)
-    except Exception as exc:
-        log.warning("[jw/search] %s", exc)
-    return []
-
-
-# ── Title detail ──────────────────────────────────────────────────────────────
-
-async def get_title(title_id: int, content_type: str = "movie",
-                    locale: str = _LOCALE) -> dict | None:
-    """
-    Fetch full title detail including all offers.
-    content_type: 'movie' or 'show'
-    """
-    url = f"{_BASE}/titles/{content_type}/{title_id}/locale/{locale}"
-    try:
-        async with httpx.AsyncClient(timeout=15, headers=_HEADER) as hx:
-            r = await hx.get(url)
-            if r.status_code == 200:
-                return r.json()
-            log.warning("[jw/title] HTTP %s id=%s", r.status_code, title_id)
-    except Exception as exc:
-        log.warning("[jw/title] %s", exc)
-    return None
-
-
-# ── Offer formatting ──────────────────────────────────────────────────────────
 
 _MTYPE_ORDER = ["flatrate", "free", "ads", "buy", "rent"]
 _MTYPE_LABEL = {
@@ -125,38 +30,87 @@ _MTYPE_LABEL = {
 }
 
 
-async def format_offers(offers: list, locale: str = _LOCALE) -> str:
+async def search(query: str, api_key: str, page_size: int = 8) -> list[dict]:
     """
-    Convert list of offer dicts → formatted availability text.
-    Resolves provider IDs to human-readable names.
-    Returns markdown string.
+    Search TMDB for titles matching query.
+    Returns list of dicts with: id, media_type, title/name, release_date/first_air_date
     """
-    if not offers:
-        return "_Not available on any streaming platform yet._"
+    try:
+        async with httpx.AsyncClient(timeout=15) as hx:
+            r = await hx.get(
+                f"{_TMDB_BASE}/search/multi",
+                params={"api_key": api_key, "query": query,
+                        "include_adult": "false", "page": 1},
+            )
+            if r.status_code == 200:
+                results = r.json().get("results", [])
+                return [x for x in results if x.get("media_type") in ("movie", "tv")][:page_size]
+            log.warning("[ott/search] TMDB HTTP %s", r.status_code)
+    except Exception as exc:
+        log.warning("[ott/search] %s", exc)
+    return []
 
-    providers = await _ensure_providers(locale)
-    grouped: dict[str, list[str]] = {}
 
-    for offer in offers:
-        mtype = (offer.get("monetization_type") or "").lower()
-        pid   = offer.get("provider_id")
-        name  = providers.get(int(pid), f"Provider {pid}") if pid else "Unknown"
-        if mtype in _MTYPE_LABEL:
-            grouped.setdefault(mtype, [])
-            if name not in grouped[mtype]:
-                grouped[mtype].append(name)
+# Alias kept for backward compatibility
+search_all = search
 
-    if not grouped:
+
+async def get_providers(
+    tmdb_id: int,
+    media_type: str,   # "movie" or "tv"
+    api_key: str,
+    country: str = "IN",
+) -> dict:
+    """
+    Fetch streaming providers for a title from TMDB.
+    Returns dict with 'providers' (grouped), 'link' (JustWatch URL), 'title', 'year'.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=15) as hx:
+            r = await hx.get(
+                f"{_TMDB_BASE}/{media_type}/{tmdb_id}/watch/providers",
+                params={"api_key": api_key},
+            )
+            if r.status_code == 200:
+                results = r.json().get("results", {})
+                # Prefer India, fall back to US
+                region = results.get(country) or results.get("US") or {}
+                return {
+                    "providers": region,
+                    "link":      region.get("link", ""),
+                    "all":       results,
+                }
+    except Exception as exc:
+        log.warning("[ott/providers] %s", exc)
+    return {"providers": {}, "link": "", "all": {}}
+
+
+async def format_providers(providers: dict, title: str) -> str:
+    """
+    Format TMDB watch providers dict into readable text.
+    providers: the country-specific sub-dict from TMDB watch/providers response
+    """
+    if not providers:
         return "_Not available on any streaming platform yet._"
 
     lines = []
-    for mtype in _MTYPE_ORDER:
-        names = grouped.get(mtype, [])
-        if names:
-            emoji, label = _MTYPE_LABEL[mtype]
+    for key in _MTYPE_ORDER:
+        items = providers.get(key, [])
+        if items:
+            emoji, label = _MTYPE_LABEL[key]
+            names = [p.get("provider_name", "?") for p in items]
             lines.append(f"{emoji} **{label}:** {', '.join(names)}")
 
     return "\n".join(lines) if lines else "_Not available on any streaming platform yet._"
 
-# Alias — search_all is the same as search (kept for backward compatibility)
-search_all = search
+
+async def get_title(tmdb_id: int, content_type: str = "movie",
+                    api_key: str = "", country: str = "IN") -> dict | None:
+    """Fetch full title detail — kept for API compatibility."""
+    data = await get_providers(tmdb_id, content_type, api_key, country)
+    return {"offers": data.get("providers", {})} if data else None
+
+
+async def format_offers(offers: dict, locale: str = "en_IN") -> str:
+    """Alias — offers here is the providers sub-dict."""
+    return await format_providers(offers, "")
