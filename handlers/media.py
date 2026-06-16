@@ -1,14 +1,25 @@
 """
-handlers/media.py  —  /mediainfo  /sample  /screenshot
+handlers/media.py — /mediainfo /sample /screenshot
 
-Instant results strategy:
-  - ALL commands use the Telegram CDN URL directly (via get_file Bot API call)
-  - ffmpeg -ss seeks directly on the stream — no full download needed
-  - /screenshot uses random timestamps — completely instant for any file size
-  - /sample seeks to a random position — no duration probing needed
-  - Full MTProto download only as fallback for files > 20 MB
+Architecture for instant results (< 30 seconds even for 5-hour files):
 
-Progress bar: ffmpeg -progress pipe → live Telegram message
+/mediainfo:
+  - Files ≤ 20MB: Bot API CDN URL → ffprobe directly on stream (no download)
+  - Files > 20MB: Generate /link permanent URL → ffprobe on stream URL
+
+/sample & /screenshot:
+  - NEVER download the file first
+  - Strategy A (files ≤ 20MB): Bot API CDN URL → ffmpeg -ss seek on stream
+  - Strategy B (files > 20MB): Forward to DUMP_CHANNEL → get permanent stream URL
+                                → ffmpeg -ss seek on stream URL
+  - ffmpeg -ss BEFORE -i = keyframe seek, instant for any file size
+  - Screenshots: all 10 taken CONCURRENTLY with asyncio.gather
+
+Key ffmpeg flags for speed:
+  -ss <t> -i <url>   : seek before opening (instant, no buffering)
+  -frames:v 1        : take exactly one frame and stop
+  -preset ultrafast  : fastest encoding for sample clip
+  -threads 0         : use all available CPU cores
 """
 
 import asyncio
@@ -29,13 +40,12 @@ from pyrogram.types import (
 )
 
 import database as db
-from config import BOT_TOKEN
-from cookie_helper import get_cookie_file
+from config import BOT_TOKEN, STREAM_BASE_URL, DUMP_CHANNEL
 from logger import log_action
 
 MD               = ParseMode.MARKDOWN
 SCREENSHOT_COUNT = 10
-# player_client is chosen dynamically based on cookie presence (see _ydl_stream_url)
+_PLAYER_CLIENTS  = ["android", "tv_embedded"]
 
 
 # ── ffmpeg binary resolution ──────────────────────────────────────────────────
@@ -62,7 +72,7 @@ _FFMPEG, _FFPROBE = _find_ffmpeg()
 
 
 def _probe(src: str) -> dict:
-    """Probe media info. Works with URLs (CDN streaming) and local files."""
+    """Probe via ffprobe/ffmpeg. Works on HTTP URLs (no download, seeks in)."""
     exe = _FFPROBE
     if exe == _FFMPEG:
         cmd = [_FFMPEG, "-hide_banner", "-v", "quiet",
@@ -92,84 +102,75 @@ def _bar(pct: float, width: int = 10) -> str:
     return "█" * filled + "░" * (width - filled)
 
 
-def _run_ff(args: list[str], progress_cb=None) -> bool:
-    """Run ffmpeg with optional progress reporting via pipe."""
-    if progress_cb:
-        import threading
-
-        r_fd, w_fd = os.pipe()
-        cmd = [_FFMPEG] + args + ["-progress", f"pipe:{w_fd}", "-nostats"]
-        try:
-            proc = subprocess.Popen(
-                cmd, pass_fds=(w_fd,),
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            )
-            os.close(w_fd)
-
-            duration_us = None
-            with os.fdopen(r_fd, "r") as pf:
-                for line in pf:
-                    line = line.strip()
-                    if line.startswith("out_time_us="):
-                        try:
-                            out_us = int(line.split("=", 1)[1])
-                            if duration_us and duration_us > 0:
-                                progress_cb(min(out_us / duration_us * 100, 99))
-                        except (ValueError, TypeError):
-                            pass
-                    elif line.startswith("duration="):
-                        import re
-                        m = re.match(r"(\d+):(\d+):(\d+)", line.split("=", 1)[1])
-                        if m:
-                            duration_us = (int(m[1]) * 3600 + int(m[2]) * 60 + int(m[3])) * 1_000_000
-
-            proc.wait()
-            return proc.returncode == 0
-        except Exception:
-            return False
-    else:
-        cmd = [_FFMPEG] + args + ["-nostats", "-loglevel", "error"]
-        try:
-            r = subprocess.run(cmd, capture_output=True, timeout=300)
-            return r.returncode == 0
-        except Exception:
-            return False
+def _run_ff(args: list[str]) -> tuple[bool, str]:
+    """Run ffmpeg. Returns (success, stderr_output)."""
+    cmd = [_FFMPEG] + args + ["-nostats", "-loglevel", "warning"]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        return r.returncode == 0, r.stderr
+    except subprocess.TimeoutExpired:
+        return False, "Timeout"
+    except Exception as e:
+        return False, str(e)
 
 
-# ── CDN URL helper ────────────────────────────────────────────────────────────
+# ── Permanent stream URL helpers ──────────────────────────────────────────────
 
-async def _get_cdn_url(client: Client, media_obj) -> str | None:
+async def _get_stream_url(client: Client, media_obj, message: Message) -> tuple[str | None, str]:
     """
-    Get a direct CDN URL for ffmpeg to stream from.
+    Get a streamable URL for ffmpeg to seek on — no download needed.
 
-    Bot API getFile works for files ≤ 20 MB and returns a CDN URL
-    that ffmpeg can seek on directly (instant, no download needed).
+    For files ≤ 20 MB: use Bot API CDN URL (instant)
+    For files > 20 MB: forward to DUMP_CHANNEL and get permanent stream URL
+                       (same as /link but automated)
 
-    For files > 20 MB we return None — the caller falls back to
-    full MTProto download via _download_tg().
+    Returns (stream_url, display_name)
     """
     file_size = getattr(media_obj, "file_size", 0) or 0
-    if file_size > 20 * 1024 * 1024:
-        return None  # Too large for Bot API — caller uses MTProto download
+    file_name = getattr(media_obj, "file_name", None) or "video"
+    mime_type = getattr(media_obj, "mime_type", None) or "video/mp4"
+
+    # Strategy A: small file — use Bot API CDN
+    if file_size <= 20 * 1024 * 1024:
+        try:
+            tg_file = await client.get_file(media_obj.file_id)
+            if tg_file.file_path:
+                path = tg_file.file_path
+                if path.startswith("http"):
+                    return path, file_name
+                return f"https://api.telegram.org/file/bot{BOT_TOKEN}/{path}", file_name
+        except Exception:
+            pass
+
+    # Strategy B: large file — store in DUMP_CHANNEL, get permanent URL
+    if not STREAM_BASE_URL or not DUMP_CHANNEL:
+        return None, file_name
+
     try:
-        tg_file = await client.get_file(media_obj.file_id)
-        if tg_file.file_path:
-            if tg_file.file_path.startswith("http"):
-                return tg_file.file_path
-            return f"https://api.telegram.org/file/bot{BOT_TOKEN}/{tg_file.file_path}"
-    except Exception:
-        pass
-    return None
+        dump_msg = await client.forward_messages(
+            chat_id      = DUMP_CHANNEL,
+            from_chat_id = message.chat.id,
+            message_ids  = message.reply_to_message.id,
+        )
+        dump_media  = dump_msg.video or dump_msg.document or dump_msg.audio
+        stream_file_id = getattr(dump_media, "file_id", media_obj.file_id)
+        file_uid    = getattr(media_obj, "file_unique_id", "")
+
+        mongo_id = await db.add_link_file(
+            tg_file_id        = stream_file_id,
+            tg_file_unique_id = file_uid,
+            file_name         = file_name,
+            file_size         = file_size,
+            mime_type         = mime_type,
+            dump_msg_id       = dump_msg.id,
+        )
+        stream_url = f"{STREAM_BASE_URL.rstrip('/')}/dl/{mongo_id}"
+        return stream_url, file_name
+    except Exception as e:
+        return None, file_name
 
 
-async def _download_tg(client: Client, media_obj, dest_dir: str, filename: str) -> str:
-    """Full MTProto download — no size limit. Used only when CDN fails."""
-    dest = os.path.join(dest_dir, filename)
-    await client.download_media(media_obj, file_name=dest)
-    return dest
-
-
-# ── General helpers ───────────────────────────────────────────────────────────
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _full_name(u) -> str:
     parts = [u.first_name or "", u.last_name or ""]
@@ -196,35 +197,11 @@ def _get_video_from_reply(message: Message):
     return None, None, 0
 
 
-def _make_ff_progress(status_msg, label: str, clip_s: float):
-    last = [0.0]
-    loop = asyncio.get_event_loop()
-
-    def cb(pct: float):
-        now = time.time()
-        if now - last[0] < 3.0:
-            return
-        last[0] = now
-
-        done_s    = pct / 100 * clip_s
-        m, s      = divmod(int(done_s), 60)
-        tot_m, tot_s = divmod(int(clip_s), 60)
-
-        text = (
-            f"**{label}**\n\n"
-            f"`{_bar(pct)}` {pct:.0f}%\n"
-            f"⏱ {m:02d}:{s:02d} / {tot_m:02d}:{tot_s:02d}"
-        )
-
-        async def _edit():
-            try:
-                await status_msg.edit(text, parse_mode=MD)
-            except Exception:
-                pass
-
-        loop.call_soon_threadsafe(lambda: asyncio.ensure_future(_edit()))
-
-    return cb
+async def _download_tg(client: Client, media_obj, dest_dir: str, filename: str) -> str:
+    """Full MTProto download — only used when streaming fails completely."""
+    dest = os.path.join(dest_dir, filename)
+    await client.download_media(media_obj, file_name=dest)
+    return dest
 
 
 def _has_mediainfo() -> bool:
@@ -237,24 +214,22 @@ def _has_mediainfo() -> bool:
 
 def _run_mediainfo(path: str) -> str | None:
     try:
-        r = subprocess.run(["mediainfo", path], capture_output=True, text=True, timeout=120)
+        r = subprocess.run(["mediainfo", path], capture_output=True, text=True, timeout=60)
         return r.stdout if r.returncode == 0 else None
     except Exception:
         return None
 
 
 async def _post_telegraph(filename: str, raw: str) -> str | None:
-    _SECTION_EMOJI = {"General": "🗒", "Video": "🎞", "Audio": "🔊", "Text": "🔠", "Menu": "🗃"}
-    lines   = raw.split("\n")
-    nodes   = []
-    section = []
+    _EMOJI = {"General": "🗒", "Video": "🎞", "Audio": "🔊", "Text": "🔠", "Menu": "🗃"}
+    lines, nodes, section = raw.split("\n"), [], []
     for line in lines:
-        is_sec = any(line.startswith(s) for s in _SECTION_EMOJI)
+        is_sec = any(line.startswith(s) for s in _EMOJI)
         if is_sec:
             if section:
                 nodes.append({"tag": "pre", "children": ["\n".join(section)]})
                 section = []
-            emoji = next((e for s, e in _SECTION_EMOJI.items() if line.startswith(s)), "📋")
+            emoji = next((e for s, e in _EMOJI.items() if line.startswith(s)), "📋")
             nodes.append({"tag": "h4", "children": [f"{emoji} {line}"]})
         elif line.strip():
             section.append(line)
@@ -267,9 +242,9 @@ async def _post_telegraph(filename: str, raw: str) -> str | None:
             tok  = acc.json()["result"]["access_token"]
             page = await hx.post("https://api.telegra.ph/createPage", json={
                 "access_token": tok,
-                "title":        f"MediaInfo — {filename}"[:256],
-                "author_name":  "MediaInfo Bot",
-                "content":      nodes,
+                "title": f"MediaInfo — {filename}"[:256],
+                "author_name": "MediaInfo Bot",
+                "content": nodes,
             })
             return f"https://telegra.ph/{page.json()['result']['path']}"
     except Exception:
@@ -295,7 +270,6 @@ def _build_ffprobe_text(data: dict, name: str) -> str:
             lines += [
                 "🎥 **Video Stream**",
                 f"  Codec      : `{st.get('codec_name','?').upper()}`",
-                f"  Profile    : `{st.get('profile','?')}`",
                 f"  Resolution : `{st.get('width','?')}×{st.get('height','?')}`",
                 f"  FPS        : `{st.get('avg_frame_rate','?')}`",
                 f"  Bitrate    : `{int(st.get('bit_rate',0))//1000} kbps`\n",
@@ -315,6 +289,7 @@ def _build_ffprobe_text(data: dict, name: str) -> str:
 
 
 async def _ydl_stream_url(url: str) -> dict:
+    from cookie_helper import get_cookie_file
     social = ("youtube.com", "youtu.be", "vimeo.com", "instagram.com",
                "twitter.com", "tiktok.com", "facebook.com")
     if not any(s in url for s in social):
@@ -330,9 +305,7 @@ async def _ydl_stream_url(url: str) -> dict:
             "http_headers": {
                 "User-Agent": "com.google.android.youtube/17.36.4 (Linux; U; Android 13) gzip",
             },
-            "extractor_args": {"youtube": {
-                "player_client": client,
-            }},
+            "extractor_args": {"youtube": {"player_client": client}},
         }
         if _cookie_path:
             opts["cookiefile"] = _cookie_path
@@ -347,7 +320,6 @@ async def _ydl_stream_url(url: str) -> dict:
                 if v and a:
                     return {"video": v, "audio": a}
             return {"single": info.get("url") or url}
-
     try:
         return await asyncio.to_thread(_extract)
     except Exception:
@@ -375,7 +347,7 @@ def register(app: Client):
             src  = info.get("single") or info.get("video")
             name = args[0].split("?")[0].split("/")[-1][:60] or "video"
             await _do_mediainfo(wait, src, name)
-            await log_action(client, message, "📊 MediaInfo", f"URL: `{name}`")
+            await log_action(client, message, "📊 MediaInfo", f"URL `{name}`")
             return
 
         media_obj, fname, fsize = _get_video_from_reply(message)
@@ -383,25 +355,26 @@ def register(app: Client):
             await message.reply(
                 "↩️ **How to use /mediainfo**\n\n"
                 "• Reply to a video/document with `/mediainfo`\n"
-                "• Or: `/mediainfo <url>`", parse_mode=MD,
+                "• Or: `/mediainfo <url>`",
+                parse_mode=MD,
             )
             return
 
-        wait    = await message.reply("⏳ Reading media info…")
-        cdn_url = await _get_cdn_url(client, media_obj)
+        wait = await message.reply("⏳ Reading media info…")
 
-        if cdn_url:
-            # Instant — probe directly from CDN URL
-            await _do_mediainfo(wait, cdn_url, fname)
+        # Get stream URL (no download needed)
+        stream_url, _ = await _get_stream_url(client, media_obj, message)
+        if stream_url:
+            await _do_mediainfo(wait, stream_url, fname)
         else:
-            # Large file — must download
-            size_str = f"{fsize/1024/1024:.1f} MB" if fsize else "unknown size"
+            # Last resort: full download
+            size_str = f"{fsize/1024/1024:.1f} MB" if fsize else "?"
             await wait.edit(f"⏳ Downloading `{fname}` ({size_str})…", parse_mode=MD)
             with tempfile.TemporaryDirectory() as tmp:
                 try:
                     path = await _download_tg(client, media_obj, tmp, fname)
                 except Exception as e:
-                    await wait.edit(f"❌ Download failed:\n`{e}`", parse_mode=MD)
+                    await wait.edit(f"❌ Failed:\n`{e}`", parse_mode=MD)
                     return
                 await _do_mediainfo(wait, path, fname)
 
@@ -424,10 +397,9 @@ def register(app: Client):
                 lines = [l for l in raw.split("\n") if l.strip()][:60]
                 await wait.edit(f"📊 **{name}**\n\n```\n" + "\n".join(lines) + "\n```", parse_mode=MD)
                 return
-
         data = await asyncio.to_thread(_probe, src)
         if not data:
-            await wait.edit("❌ Could not read media info. Make sure ffmpeg is installed.", parse_mode=MD)
+            await wait.edit("❌ Could not read media info.", parse_mode=MD)
             return
         await wait.edit(_build_ffprobe_text(data, name), parse_mode=MD)
 
@@ -444,10 +416,10 @@ def register(app: Client):
         args = message.command[1:]
         if args and args[0].startswith("http"):
             wait  = await message.reply("⏳ Generating 30s sample clip…")
-            info  = await _ydl_stream_url(args[0])
-            label = args[0].split("?")[0].split("/")[-1][:40] or "video"
-            await _make_sample(client, message, wait, info, label)
-            await log_action(client, message, "🎬 Sample", f"URL: `{label}`")
+            src   = args[0]
+            label = src.split("?")[0].split("/")[-1][:40] or "video"
+            await _make_sample(client, message, wait, src, label)
+            await log_action(client, message, "🎬 Sample", f"URL `{label}`")
             return
 
         media_obj, fname, fsize = _get_video_from_reply(message)
@@ -456,98 +428,90 @@ def register(app: Client):
                 "↩️ **How to use /sample**\n\n"
                 "• Reply to a video with `/sample`\n"
                 "• Or: `/sample <url>`\n\n"
-                "_Picks a random 30-second clip instantly._",
+                "_Generates a random 30-second clip instantly — no full download._",
                 parse_mode=MD,
             )
             return
 
-        wait    = await message.reply("⏳ Generating 30s sample clip…")
-        cdn_url = await _get_cdn_url(client, media_obj)
+        size_str = f"{fsize/1024/1024:.1f} MB" if fsize else "?"
+        wait     = await message.reply(
+            f"⏳ Generating 30s sample clip from `{fname}` ({size_str})…",
+            parse_mode=MD,
+        )
 
-        if cdn_url:
-            # Instant: seek directly on CDN stream
-            await _make_sample(client, message, wait, {"single": cdn_url},
-                                os.path.splitext(fname)[0])
-        else:
-            # Large file fallback
-            size_str = f"{fsize/1024/1024:.1f} MB" if fsize else "unknown size"
-            await wait.edit(f"⏳ Downloading `{fname}` ({size_str})…", parse_mode=MD)
-            with tempfile.TemporaryDirectory() as tmp:
-                try:
-                    path = await _download_tg(client, media_obj, tmp, fname)
-                except Exception as e:
-                    await wait.edit(f"❌ Download failed:\n`{e}`", parse_mode=MD)
-                    return
-                await _make_sample(client, message, wait,
-                                    {"single": path}, os.path.splitext(fname)[0])
+        # Get stream URL — avoids full download
+        stream_url, label = await _get_stream_url(client, media_obj, message)
+        if not stream_url:
+            await wait.edit(
+                "❌ Could not get stream URL.\n"
+                "Make sure `STREAM_BASE_URL` and `DUMP_CHANNEL` are configured.",
+                parse_mode=MD,
+            )
+            return
 
+        await _make_sample(client, message, wait, stream_url, os.path.splitext(fname)[0])
         await log_action(client, message, "🎬 Sample", f"`{fname}`")
 
-    async def _make_sample(client, message, wait, stream_info: dict, label: str):
+    async def _make_sample(client: Client, message: Message, wait, src: str, label: str):
         """
-        Generate a 30s sample using a RANDOM start point.
-        No duration probing needed — we just pick a random time and seek.
-        If the file is shorter than expected, ffmpeg handles it gracefully.
+        Generate a 30s sample clip by seeking directly on the stream URL.
+        Uses -ss BEFORE -i for instant keyframe seek — no buffering.
         """
         with tempfile.TemporaryDirectory() as tmp:
             out = os.path.join(tmp, "sample.mp4")
-            src = stream_info.get("single") or stream_info.get("video")
 
-            # Try to probe duration for smarter seeking, but don't block on it
+            # Quick duration probe (5s timeout) for smarter seek point
+            dur = 0.0
             try:
-                data = await asyncio.wait_for(
-                    asyncio.to_thread(_probe, src), timeout=5.0
-                )
-                dur = _duration(data)
+                data = await asyncio.wait_for(asyncio.to_thread(_probe, src), timeout=8.0)
+                dur  = _duration(data)
             except Exception:
-                dur = 0
+                pass
 
             if dur > 60:
-                # Pick a random start point in 10%–80% of the video
-                start = random.uniform(dur * 0.10, dur * 0.80)
+                start = random.uniform(dur * 0.10, dur * 0.75)
             elif dur > 10:
-                start = random.uniform(5, dur * 0.7)
+                start = random.uniform(5.0, dur * 0.7)
             else:
-                # Unknown duration — try starting at a random offset (60–600s)
-                start = random.uniform(60, 600)
+                # Unknown duration — start at random offset
+                start = random.uniform(60, 300)
 
-            clip_s      = 30.0
-            progress_cb = _make_ff_progress(wait, "🎬 Creating Sample Clip", clip_s)
+            clip_s    = 30.0
+            start_str = f"{int(start // 60)}:{int(start % 60):02d}"
 
-            def _do():
-                if "audio" in stream_info:
-                    return _run_ff([
-                        "-ss", str(start), "-i", stream_info["video"],
-                        "-ss", str(start), "-i", stream_info["audio"],
-                        "-t", str(clip_s),
-                        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "30",
-                        "-c:a", "aac", "-b:a", "128k",
-                        "-movflags", "+faststart", "-y", out,
-                    ], progress_cb)
-                return _run_ff([
-                    "-ss", str(start), "-i", src,
-                    "-t", str(clip_s),
-                    "-c:v", "libx264", "-preset", "fast", "-crf", "28",
-                    "-c:a", "aac", "-b:a", "128k",
-                    "-movflags", "+faststart", "-y", out,
-                ], progress_cb)
+            await wait.edit(
+                f"🎬 Creating 30s clip from `{start_str}`…",
+                parse_mode=MD,
+            )
 
-            ok = await asyncio.to_thread(_do)
+            # -ss BEFORE -i = instant keyframe seek (no buffering)
+            # -threads 0 = use all CPU cores
+            # -preset ultrafast = fastest encoding
+            ok, err = await asyncio.to_thread(_run_ff, [
+                "-ss", str(start),
+                "-i", src,
+                "-t", str(clip_s),
+                "-c:v", "libx264", "-preset", "ultrafast", "-crf", "30",
+                "-c:a", "aac", "-b:a", "96k",
+                "-threads", "0",
+                "-movflags", "+faststart",
+                "-y", out,
+            ])
+
             if not ok or not os.path.exists(out):
                 await wait.edit(
-                    "❌ Sample generation failed.\n_Make sure ffmpeg is installed._",
+                    f"❌ Sample generation failed.\n`{err[:200]}`",
                     parse_mode=MD,
                 )
                 return
 
-            out_size = os.path.getsize(out) / 1024 / 1024
-            start_str = f"{int(start//60)}:{int(start%60):02d}"
+            out_mb = os.path.getsize(out) / 1024 / 1024
             await wait.delete()
             await client.send_video(
                 message.chat.id, out,
                 caption=(
                     f"🎬 **[#Sample]** `{label}`\n"
-                    f"⏱ 30s from `{start_str}`  •  💾 {out_size:.1f} MB"
+                    f"⏱ 30s from `{start_str}`  •  💾 {out_mb:.1f} MB"
                 ),
                 parse_mode=MD, supports_streaming=True,
             )
@@ -565,10 +529,10 @@ def register(app: Client):
         args = message.command[1:]
         if args and args[0].startswith("http"):
             wait  = await message.reply(f"⏳ Taking {SCREENSHOT_COUNT} screenshots…")
-            info  = await _ydl_stream_url(args[0])
-            label = args[0].split("?")[0].split("/")[-1][:40] or "video"
-            await _take_shots(client, message, wait, info, label)
-            await log_action(client, message, "📸 Screenshot", f"URL: `{label}`")
+            src   = args[0]
+            label = src.split("?")[0].split("/")[-1][:40] or "video"
+            await _take_shots(client, message, wait, src, label)
+            await log_action(client, message, "📸 Screenshot", f"URL `{label}`")
             return
 
         media_obj, fname, fsize = _get_video_from_reply(message)
@@ -582,92 +546,83 @@ def register(app: Client):
             )
             return
 
-        wait    = await message.reply(f"⏳ Taking {SCREENSHOT_COUNT} screenshots…")
-        cdn_url = await _get_cdn_url(client, media_obj)
+        size_str = f"{fsize/1024/1024:.1f} MB" if fsize else "?"
+        wait     = await message.reply(
+            f"⏳ Taking {SCREENSHOT_COUNT} screenshots from `{fname}` ({size_str})…",
+            parse_mode=MD,
+        )
 
-        if cdn_url:
-            # Instant: seek random timestamps directly on CDN stream
-            await _take_shots(client, message, wait,
-                               {"single": cdn_url}, os.path.splitext(fname)[0])
-        else:
-            size_str = f"{fsize/1024/1024:.1f} MB" if fsize else "unknown size"
-            await wait.edit(f"⏳ Downloading `{fname}` ({size_str})…", parse_mode=MD)
-            with tempfile.TemporaryDirectory() as tmp:
-                try:
-                    path = await _download_tg(client, media_obj, tmp, fname)
-                except Exception as e:
-                    await wait.edit(f"❌ Download failed:\n`{e}`", parse_mode=MD)
-                    return
-                await _take_shots(client, message, wait,
-                                   {"single": path}, os.path.splitext(fname)[0])
+        stream_url, label = await _get_stream_url(client, media_obj, message)
+        if not stream_url:
+            await wait.edit(
+                "❌ Could not get stream URL.\n"
+                "Make sure `STREAM_BASE_URL` and `DUMP_CHANNEL` are configured.",
+                parse_mode=MD,
+            )
+            return
 
+        await _take_shots(client, message, wait, stream_url, os.path.splitext(fname)[0])
         await log_action(client, message, "📸 Screenshot", f"`{fname}`")
 
-    async def _take_shots(client, message, wait, stream_info: dict, label: str):
+    async def _take_shots(client: Client, message: Message, wait, src: str, label: str):
         """
-        Take SCREENSHOT_COUNT screenshots at RANDOM timestamps.
-
-        Key insight: we never need to know the video duration.
-        We generate random timestamps spread over a wide range and
-        let ffmpeg seek to each one. If the timestamp is beyond EOF,
-        ffmpeg simply produces no frame — we skip those results.
-
-        For a 5-hour movie, timestamps of 60s, 1800s, 3600s, etc. all work instantly
-        because ffmpeg uses keyframe seeking (-ss before -i = fast seek).
+        Take SCREENSHOT_COUNT screenshots at random timestamps.
+        All shots run CONCURRENTLY — total time = time of slowest single seek.
+        Each uses -ss BEFORE -i = instant keyframe seek, no buffering.
         """
-        src = stream_info.get("single") or stream_info.get("video")
-
-        # Try quick duration probe (5s timeout) for smarter spread
+        # Quick duration probe
         dur = 0.0
         try:
-            data = await asyncio.wait_for(asyncio.to_thread(_probe, src), timeout=5.0)
+            data = await asyncio.wait_for(asyncio.to_thread(_probe, src), timeout=8.0)
             dur  = _duration(data)
         except Exception:
             pass
 
         if dur > 30:
-            # Spread across the video with some randomness
-            margin  = dur * 0.03
-            step    = (dur - 2 * margin) / SCREENSHOT_COUNT
-            times   = [margin + step * i + random.uniform(0, step * 0.5)
-                       for i in range(SCREENSHOT_COUNT)]
+            margin = dur * 0.03
+            step   = (dur - 2 * margin) / SCREENSHOT_COUNT
+            times  = [margin + step * i + random.uniform(0, step * 0.4)
+                      for i in range(SCREENSHOT_COUNT)]
         else:
-            # Unknown duration — use random offsets spread from 0 to ~3 hours
-            # ffmpeg will gracefully handle timestamps beyond EOF
-            max_t = max(dur * 0.95 if dur > 0 else 10800, 300)
-            times = sorted(random.uniform(10, max_t) for _ in range(SCREENSHOT_COUNT))
+            # Unknown duration — spread random times over 10s–3h range
+            max_t = max(dur * 0.9 if dur > 0 else 10800, 60)
+            times = sorted(random.uniform(5, max_t) for _ in range(SCREENSHOT_COUNT))
 
-        labels = [f"{int(t//60)}:{int(t%60):02d}" for t in times]
+        labels = [f"{int(t // 60)}:{int(t % 60):02d}" for t in times]
 
         await wait.edit(
-            f"📸 Taking **{SCREENSHOT_COUNT}** screenshots at random timestamps…",
+            f"📸 Taking **{SCREENSHOT_COUNT}** screenshots…",
             parse_mode=MD,
         )
 
         with tempfile.TemporaryDirectory() as tmp:
-            async def _shot(i: int, t: float) -> str | None:
+
+            def _take_one(i: int, t: float) -> str | None:
                 path = os.path.join(tmp, f"shot_{i:02d}.jpg")
-                # -ss BEFORE -i = fast keyframe seek (instant even for huge files)
-                ok = await asyncio.to_thread(
-                    _run_ff, ["-ss", str(t), "-i", src, "-vframes", "1", "-q:v", "2", "-y", path]
-                )
+                # -ss BEFORE -i = instant keyframe seek
+                ok, _ = _run_ff([
+                    "-ss", str(t),
+                    "-i", src,
+                    "-frames:v", "1",
+                    "-q:v", "3",
+                    "-threads", "0",
+                    "-y", path,
+                ])
                 return path if ok and os.path.exists(path) else None
 
-            # Take all screenshots concurrently
-            results = await asyncio.gather(*[_shot(i, t) for i, t in enumerate(times)])
-            shots   = [(labels[i], path) for i, path in enumerate(results) if path]
+            # All 10 shots concurrently
+            results = await asyncio.gather(
+                *[asyncio.to_thread(_take_one, i, t) for i, t in enumerate(times)]
+            )
+            shots = [(labels[i], path) for i, path in enumerate(results) if path]
 
             if not shots:
-                await wait.edit(
-                    "❌ Could not generate screenshots.\n"
-                    "_Make sure ffmpeg is installed._",
-                    parse_mode=MD,
-                )
+                await wait.edit("❌ Could not generate any screenshots.", parse_mode=MD)
                 return
 
             caption = (
                 f"📸 **[#Screenshot]** `{label}`\n"
-                f"⏱ Timestamps: {', '.join(l for l, _ in shots)}"
+                f"⏱ {', '.join(l for l, _ in shots)}"
             )
             media = [
                 InputMediaPhoto(

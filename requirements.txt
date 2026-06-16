@@ -21,3 +21,4 @@ aiohttp==3.9.5
 
 # Utilities
 python-dotenv==1.0.1
+pytubefix>=6.0.0

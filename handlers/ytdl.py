@@ -1,11 +1,11 @@
 """
-handlers/ytdl.py  —  /yt command
+handlers/ytdl.py  —  /yt command  (youtube.com only)
 
-YouTube bot-detection fix:
-  Uses yt-dlp's innertube API directly (no webpage fetch) with
-  a real browser User-Agent. Falls back through multiple strategies.
+Bot-detection fix:
+  Uses pytubefix for the info fetch (same cipher logic as the Music downloader),
+  then cobalt.tools for video download links, and yt-dlp android client for MP3.
 
-Speed: video info fetch is near-instant since we skip webpage loading.
+Domain: youtube.com ONLY (music.youtube.com is handled by /song)
 """
 
 import asyncio
@@ -17,7 +17,6 @@ import tempfile
 import time
 
 import httpx
-import yt_dlp
 from pyrogram import Client, filters
 from pyrogram.enums import ParseMode
 from pyrogram.types import (
@@ -50,50 +49,6 @@ QUALITY_OPTIONS = [
 ]
 
 _sessions: dict[str, dict] = {}
-
-# ── yt-dlp strategy ───────────────────────────────────────────────────────────
-# Strategy 1 (with cookies): web client — fully authenticated, most reliable
-# Strategy 2 (no cookies):   tv_embedded — bypasses bot check without login
-#   Key: player_skip=["webpage"] avoids the JS bot-detection entirely
-#   Key: innertube_client means we use the internal API, not the public webpage
-
-def _ydl_opts(cookie_path: str | None, extra: dict | None = None) -> dict:
-    """
-    Build yt-dlp options.
-
-    Client strategy (in order of reliability for server environments):
-      android       — works without cookies for most content, fast innertube API
-      android_music — fallback for music content
-      tv_embedded   — fallback when android is blocked
-      web           — with cookies: fully authenticated, most reliable
-
-    We always try android first because it uses the Innertube API directly,
-    bypassing the webpage bot-detection entirely.
-    """
-    if cookie_path:
-        # With cookies: web is most reliable (full session auth)
-        client_list = ["web", "android"]
-    else:
-        # Without cookies: android bypasses bot-check for most content
-        client_list = ["android", "android_music", "tv_embedded"]
-
-    opts = {
-        "quiet":       True,
-        "no_warnings": True,
-        "extractor_args": {
-            "youtube": {
-                "player_client": client_list,
-            }
-        },
-        "http_headers": {
-            "User-Agent": "com.google.android.youtube/17.36.4 (Linux; U; Android 13) gzip",
-        },
-    }
-    if cookie_path:
-        opts["cookiefile"] = cookie_path
-    if extra:
-        opts.update(extra)
-    return opts
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -138,7 +93,6 @@ def _human_speed(bps: float) -> str:
 
 
 def _make_progress_hook(status_msg, label: str):
-    """Returns a yt-dlp progress hook that updates status_msg live."""
     last_edit = [0.0]
     loop      = asyncio.get_event_loop()
 
@@ -184,11 +138,15 @@ def _make_progress_hook(status_msg, label: str):
 
 async def _cobalt_link(url: str, quality: str) -> str | None:
     try:
-        async with httpx.AsyncClient(timeout=20) as hx:
+        async with httpx.AsyncClient(timeout=25) as hx:
             resp = await hx.post(
                 COBALT_API,
-                json={"url": url, "videoQuality": quality,
-                      "downloadMode": "auto", "filenameStyle": "pretty"},
+                json={
+                    "url":           url,
+                    "videoQuality":  quality,
+                    "downloadMode":  "auto",
+                    "filenameStyle": "pretty",
+                },
                 headers=COBALT_HEADERS,
             )
             data   = resp.json()
@@ -200,6 +158,70 @@ async def _cobalt_link(url: str, quality: str) -> str | None:
     except Exception:
         pass
     return None
+
+
+def _fetch_info_pytubefix(url: str) -> dict:
+    """
+    Fetch video info using pytubefix — handles cipher without yt-dlp.
+    Returns a dict with title, uploader, duration, thumbnail, video_id, formats.
+    """
+    from pytubefix import YouTube
+
+    yt = YouTube(url)
+
+    # Gather format heights from streams
+    heights = sorted({
+        s.resolution.replace("p", "")
+        for s in yt.streams.filter(adaptive=True, file_extension="mp4")
+        if s.resolution
+    }, key=lambda x: int(x) if x.isdigit() else 0, reverse=True)
+
+    return {
+        "title":     yt.title,
+        "uploader":  yt.author,
+        "duration":  yt.length or 0,
+        "thumbnail": yt.thumbnail_url or "",
+        "video_id":  yt.video_id,
+        "heights":   [int(h) for h in heights if h.isdigit()],
+    }
+
+
+def _download_mp3_ytdlp(url: str, out_dir: str,
+                         cookie_path: str | None,
+                         hook) -> str | None:
+    """Download MP3 using yt-dlp android client."""
+    import yt_dlp
+
+    client = ["android"] if not cookie_path else ["web", "android"]
+    opts = {
+        "quiet":       True,
+        "no_warnings": True,
+        "format":      "bestaudio[ext=m4a]/bestaudio/best",
+        "outtmpl":     os.path.join(out_dir, "%(id)s.%(ext)s"),
+        "http_headers": {
+            "User-Agent": "com.google.android.youtube/17.36.4 (Linux; U; Android 13) gzip",
+        },
+        "extractor_args": {"youtube": {"player_client": client}},
+        "progress_hooks": [hook],
+        "postprocessors": [
+            {"key": "FFmpegExtractAudio",
+             "preferredcodec": "mp3", "preferredquality": "192"},
+            {"key": "FFmpegMetadata", "add_metadata": True},
+        ],
+    }
+    if cookie_path:
+        opts["cookiefile"] = cookie_path
+
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            video_id = info.get("id", "")
+            mp3 = os.path.join(out_dir, f"{video_id}.mp3")
+            if not os.path.exists(mp3):
+                mp3 = _find_file(out_dir, "mp3")
+            return mp3
+    except Exception:
+        return None
 
 
 # ── Handlers ──────────────────────────────────────────────────────────────────
@@ -229,53 +251,73 @@ def register(app: Client):
                 "❌ **Not a valid YouTube link.**\n\n"
                 "• `https://youtube.com/watch?v=...`\n"
                 "• `https://youtu.be/...`\n"
-                "• `https://youtube.com/shorts/...`",
+                "• `https://youtube.com/shorts/...`\n\n"
+                "For songs use `/song <name>` instead.",
                 parse_mode=MD,
             )
             return
 
-        wait        = await message.reply("⏳ Fetching video info…")
-        cookie_path = await get_cookie_file()
+        wait = await message.reply("⏳ Fetching video info…")
 
-        def _extract():
-            opts = _ydl_opts(cookie_path, {"skip_download": True, "noplaylist": True})
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                return ydl.extract_info(url, download=False)
-
+        # Use pytubefix for info — no bot detection issues
         try:
-            info = await asyncio.to_thread(_extract)
+            info = await asyncio.to_thread(_fetch_info_pytubefix, url)
         except Exception as e:
-            err = str(e)
-            # Give a helpful message for the most common errors
-            if "Sign in" in err or "bot" in err.lower():
+            # Fallback: yt-dlp android client
+            try:
+                import yt_dlp
+                cookie_path = await get_cookie_file()
+                client_list = ["web", "android"] if cookie_path else ["android"]
+                opts = {
+                    "quiet": True, "no_warnings": True,
+                    "skip_download": True, "noplaylist": True,
+                    "http_headers": {
+                        "User-Agent": "com.google.android.youtube/17.36.4 (Linux; U; Android 13) gzip",
+                    },
+                    "extractor_args": {"youtube": {"player_client": client_list}},
+                }
+                if cookie_path:
+                    opts["cookiefile"] = cookie_path
+
+                def _ytdlp_info():
+                    with yt_dlp.YoutubeDL(opts) as ydl:
+                        return ydl.extract_info(url, download=False)
+
+                raw = await asyncio.to_thread(_ytdlp_info)
+                info = {
+                    "title":    raw.get("title", "Unknown"),
+                    "uploader": raw.get("uploader") or raw.get("channel") or "Unknown",
+                    "duration": int(raw.get("duration") or 0),
+                    "thumbnail": raw.get("thumbnail", ""),
+                    "video_id": raw.get("id", ""),
+                    "heights": sorted({
+                        f.get("height", 0)
+                        for f in raw.get("formats", [])
+                        if f.get("vcodec", "none") != "none" and f.get("height")
+                    }, reverse=True),
+                }
+            except Exception as e2:
                 await wait.edit(
-                    "❌ **YouTube requires sign-in for this video.**\n\n"
-                    "Upload your cookies using the `/cook` command and try again.",
+                    f"❌ Could not fetch video info:\n`{e2}`\n\n"
+                    "_Upload cookies with `/cook` if this is a members-only video._",
                     parse_mode=MD,
                 )
-            else:
-                await wait.edit(f"❌ Could not fetch video info:\n`{err}`", parse_mode=MD)
-            return
+                return
 
         title     = info.get("title", "Unknown")
-        uploader  = info.get("uploader") or info.get("channel") or "Unknown"
+        uploader  = info.get("uploader", "Unknown")
         duration  = int(info.get("duration") or 0)
-        views     = f"{info.get('view_count', 0):,}"
-        likes     = f"{info.get('like_count', 0):,}" if info.get("like_count") else "N/A"
         thumbnail = info.get("thumbnail", "")
-        formats   = info.get("formats", [])
-        video_id  = info.get("id", "")
-        clean_url = f"https://www.youtube.com/watch?v={video_id}"
+        video_id  = info.get("video_id", "")
+        heights   = info.get("heights", [1080, 720, 480, 360])
+        max_h     = max(heights) if heights else 1080
 
-        max_h = max(
-            (f.get("height", 0) for f in formats
-             if f.get("vcodec", "none") != "none" and f.get("height")),
-            default=720,
-        )
+        # Clean URL for cobalt
+        clean_url = f"https://www.youtube.com/watch?v={video_id}" if video_id else url
 
         k = _key(clean_url)
         _sessions[k] = {
-            "url":  clean_url,
+            "url": clean_url,
             "meta": {
                 "title":     title,
                 "uploader":  uploader,
@@ -300,7 +342,7 @@ def register(app: Client):
         caption = (
             f"🎬 **{title}**\n"
             f"👤 `{uploader}`\n"
-            f"⏱ `{_fmt_dur(duration)}`  •  👁 `{views}`  •  👍 `{likes}`\n\n"
+            f"⏱ `{_fmt_dur(duration)}`\n\n"
             "**Select a format:**"
         )
 
@@ -316,8 +358,6 @@ def register(app: Client):
 
         await log_action(client, message, "📥 YT Info", f"`{title}`")
 
-    # ── Callback ──────────────────────────────────────────────────────────────
-
     @app.on_callback_query(filters.regex(r"^ytq"))
     async def yt_callback(client: Client, query: CallbackQuery):
         await query.answer()
@@ -326,18 +366,20 @@ def register(app: Client):
             await query.message.delete()
             return
 
-        _, k, quality = query.data.split("|", 2)
+        parts = query.data.split("|", 2)
+        if len(parts) != 3:
+            return
+        _, k, quality = parts
+
         session = _sessions.get(k)
         if not session:
-            await query.message.reply("❌ Session expired. Please send the link again.")
+            await query.message.reply("❌ Session expired. Send the link again.")
             return
 
         if quality == "audio":
             await _send_audio(client, query, session["url"], session["meta"])
         else:
             await _send_video_link(query, session["url"], quality)
-
-    # ── Video link (cobalt.tools) ─────────────────────────────────────────────
 
     async def _send_video_link(query: CallbackQuery, url: str, quality: str):
         orig = query.message.caption or ""
@@ -372,8 +414,6 @@ def register(app: Client):
             parse_mode=MD,
         )
 
-    # ── MP3 audio download ────────────────────────────────────────────────────
-
     async def _send_audio(client: Client, query: CallbackQuery, url: str, meta: dict):
         title     = meta.get("title",    "Unknown")
         uploader  = meta.get("uploader", "Unknown")
@@ -392,7 +432,7 @@ def register(app: Client):
             parse_mode=MD,
         )
 
-        # Fetch thumbnail and cookies concurrently
+        # Fetch thumbnail and cookie concurrently
         async def _get_thumb():
             if not thumb_url:
                 return None
@@ -409,54 +449,29 @@ def register(app: Client):
         )
 
         with tempfile.TemporaryDirectory() as tmp:
-            # If cookie_path from get_cookie_file() is outside tmp, copy into tmp
             if cookie_path and not cookie_path.startswith(tmp):
                 import shutil
-                local_cookie = os.path.join(tmp, "cookies.txt")
-                shutil.copy2(cookie_path, local_cookie)
-                cookie_path = local_cookie
+                local = os.path.join(tmp, "cookies.txt")
+                shutil.copy2(cookie_path, local)
+                cookie_path = local
 
-            hook = _make_progress_hook(status, f"⬇️ Downloading: **{title[:40]}**")
+            hook = _make_progress_hook(status, f"⬇️ **{title[:40]}**")
 
-            ydl_opts = _ydl_opts(cookie_path, {
-                "format":         "bestaudio[ext=m4a]/bestaudio/best",
-                "outtmpl":        os.path.join(tmp, "%(id)s.%(ext)s"),
-                "progress_hooks": [hook],
-                "postprocessors": [
-                    {"key": "FFmpegExtractAudio",
-                     "preferredcodec": "mp3", "preferredquality": "192"},
-                    {"key": "FFmpegMetadata", "add_metadata": True},
-                ],
-            })
+            mp3 = await asyncio.to_thread(
+                _download_mp3_ytdlp, url, tmp, cookie_path, hook
+            )
 
-            def _dl():
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    ydl.extract_info(url, download=True)
-
-            try:
-                await asyncio.to_thread(_dl)
-            except Exception as e:
-                err = str(e)
-                if "Sign in" in err or "bot" in err.lower():
-                    await status.edit(
-                        "❌ **YouTube requires sign-in.**\n"
-                        "Upload cookies with `/cook` and try again.",
-                        parse_mode=MD,
-                    )
-                else:
-                    await status.edit(f"❌ Download failed:\n`{err}`", parse_mode=MD)
-                return
-
-            mp3 = os.path.join(tmp, f"{video_id}.mp3")
-            if not os.path.exists(mp3):
-                mp3 = _find_file(tmp, "mp3")
-            if not mp3:
-                await status.edit("❌ Could not find the downloaded audio file.")
+            if not mp3 or not os.path.exists(mp3):
+                await status.edit(
+                    "❌ Download failed.\n"
+                    "_Try uploading cookies with `/cook` for age-restricted videos._",
+                    parse_mode=MD,
+                )
                 return
 
             size_mb = os.path.getsize(mp3) / 1024 / 1024
             if size_mb > 50:
-                await status.edit(f"❌ File too large ({size_mb:.1f} MB). Telegram limit is 50 MB.")
+                await status.edit(f"❌ File too large ({size_mb:.1f} MB). Limit is 50 MB.")
                 return
 
             # Embed album art
